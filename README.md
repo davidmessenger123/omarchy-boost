@@ -27,6 +27,12 @@ which needs root. The widget elevates **only this script** through `pkexec`;
 a polkit rule grants it passwordless access, so dragging the slider never
 prompts.
 
+Works on both Intel and AMD x86: with `amd-pstate` the cap is applied as a
+CPPC max-performance limit (kernels ≥ 6.5), and `acpi-cpufreq` honours the
+write directly. The base figure comes from `base_frequency` (Intel / amd-pstate
+≥ 6.5), falling back to the ACPI CPPC `nominal_freq`; temperature is read from
+`coretemp` on Intel and `k10temp` (Tctl) on AMD.
+
 ## One-time setup (needs root)
 
 1. Install the polkit rule:

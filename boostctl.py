@@ -62,43 +62,63 @@ def persisted():
         return "3.0"
 
 
+def base_freq():
+    """Best available 'base' clock: base_frequency, else the CPPC nominal."""
+    for d in cpu_dirs():
+        base = read_int(os.path.join(d, "base_frequency"))
+        if base is not None:
+            return base
+    for entry in sorted(glob.glob(os.path.join(CPU_ROOT, "cpu[0-9]*", "acpi_cppc", "nominal_freq"))):
+        nominal = read_int(entry)
+        if nominal is not None:
+            return nominal
+    return None
+
+
 def get_state():
-    caps, turbos, bases = [], [], []
+    caps, turbos = [], []
     for d in cpu_dirs():
         cap = read_int(os.path.join(d, "scaling_max_freq"))
         turbo = read_int(os.path.join(d, "cpuinfo_max_freq"))
-        base = read_int(os.path.join(d, "base_frequency"))
         if cap is not None:
             caps.append(cap)
         if turbo is not None:
             turbos.append(turbo)
-        if base is not None:
-            bases.append(base)
+    base = base_freq()
     return {
         "max": round(min(caps) / 1e6, 1) if caps else None,
         "turbo": round(max(turbos) / 1e6, 1) if turbos else None,
-        "base": round(bases[0] / 1e6, 1) if bases else FALLBACK_BASE_GHZ,
+        "base": round(base / 1e6, 1) if base else FALLBACK_BASE_GHZ,
         "temp": package_temp(),
         "default": persisted(),
     }
 
 
-def package_temp():
-    """Package temperature straight from hwmon (no `sensors` subprocess)."""
-    hwmon = "/sys/class/hwmon"
+def package_temp(hwmon_root="/sys/class/hwmon"):
+    """Package temperature straight from hwmon (no `sensors` subprocess).
+
+    Intel: coretemp "Package id 0". AMD: k10temp's temp1 (Tctl/Tdie).
+    """
     try:
-        for entry in sorted(os.listdir(hwmon)):
-            with open(os.path.join(hwmon, entry, "name"), encoding="utf-8") as fh:
-                if fh.read().strip() != "coretemp":
-                    continue
-            for f in os.listdir(os.path.join(hwmon, entry)):
-                if not f.endswith("_label"):
-                    continue
-                with open(os.path.join(hwmon, entry, f), encoding="utf-8") as fh:
-                    if fh.read().strip() != "Package id 0":
+        for entry in sorted(os.listdir(hwmon_root)):
+            base = os.path.join(hwmon_root, entry)
+            try:
+                with open(os.path.join(base, "name"), encoding="utf-8") as fh:
+                    name = fh.read().strip()
+            except OSError:
+                continue
+            if name == "coretemp":
+                for f in os.listdir(base):
+                    if not f.endswith("_label"):
                         continue
-                inp = os.path.join(hwmon, entry, f[: -len("_label")] + "_input")
-                with open(inp, encoding="utf-8") as fh:
+                    with open(os.path.join(base, f), encoding="utf-8") as fh:
+                        if fh.read().strip() != "Package id 0":
+                            continue
+                    inp = f[: -len("_label")] + "_input"
+                    with open(os.path.join(base, inp), encoding="utf-8") as fh:
+                        return round(int(fh.read().strip()) / 1000.0, 1)
+            elif name == "k10temp":
+                with open(os.path.join(base, "temp1_input"), encoding="utf-8") as fh:
                     return round(int(fh.read().strip()) / 1000.0, 1)
     except Exception:
         pass
