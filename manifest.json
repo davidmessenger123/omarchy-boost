@@ -1,0 +1,37 @@
+{
+  "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
+  "schemaVersion": 1,
+  "id": "davidjm.boost",
+  "name": "Boost",
+  "version": "1.0.0",
+  "author": "David JM",
+  "license": "MIT",
+  "description": "Limit or lift your CPU's max boost clock straight from the bar. Left-click opens a slider with quick presets found in the popup; every change applies live to all cores and is re-applied on the next boot.",
+  "repository": "https://github.com/davidmessenger123/omarchy-boost",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Boost.qml"
+  },
+  "barWidget": {
+    "displayName": "Boost",
+    "description": "A bolt glyph showing the current max boost cap. Left-click opens a continuous slider (1.0–5.0 GHz) plus preset chips — BASE, 3.0, 3.5, 4.0, MAX — and live package temperature. Changes apply immediately to every core via a passwordless polkit helper and persist across reboots (re-applied at boot by cpu-cap-boost.service). Right-click cycles the same presets on the fly; middle-click re-syncs the readout with sysfs.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "maxGHz": "3.0"
+    },
+    "schema": [
+      {
+        "key": "maxGHz",
+        "type": "enum",
+        "label": "Max boost (GHz)",
+        "options": ["2.6", "3.0", "3.5", "4.0", "5.0"],
+        "defaultValue": "3.0",
+        "description": "Max boost cap. Set live with the popup slider (any 1.0–5.0 GHz value); the last-applied value is persisted and re-applied by the cpu-cap-boost.service systemd unit on boot."
+      }
+    ]
+  }
+}

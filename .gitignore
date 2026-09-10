@@ -1,0 +1,2 @@
+# Runtime state: written on every cap change by persist.py; not source.
+maxboost
