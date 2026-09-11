@@ -3,8 +3,8 @@
 An Omarchy bar widget that lets you cap your CPU's max boost clock on the fly.
 
 - **Left click** opens a panel with a continuous slider (1.0 GHz up to the
-  CPU's own reported max boost) and preset chips: **BASE**, **3.0**, **3.5**,
-  **4.0**, **MAX**.
+  CPU's own reported max boost) and preset chips: **BASE**, evenly-spaced
+  steps up to **MAX**.
 - **Right click** cycles those presets without opening the panel.
 - **Middle click** re-syncs the readout with sysfs.
 - The bar button shows the live cap (and package temperature in the tooltip).
@@ -71,6 +71,16 @@ The slider, the presets, and `applyValue` never allow a cap above the CPU's
 reported full-turbo, and `boostctl.py` enforces the same ceiling per core when
 it writes `scaling_max_freq` — so neither the widget, a manual `set`, nor the
 boot service can ever exceed what the CPU reports.
+
+### Presets (`presets`)
+
+Preset chips and the right-click cycle default to **auto**: BASE uses the
+reported base clock, MAX the reported max boost, and the in-between chips are
+evenly spaced across that range — a 3.8–4.7 GHz chip gets 3.8 / 4.0 / 4.3 /
+4.5 / 4.7, while a 2.6–5.0 GHz chip gets 2.6 / 3.2 / 3.8 / 4.4 / 5.0. The steps
+are re-derived from each CPU as it loads, so the buttons always sit inside the
+chip's own range instead of falling below BASE. Set a custom comma-separated
+list (in the popup or the settings schema) to override; blank = auto.
 
 ## Manual max ceiling (`capMax`)
 

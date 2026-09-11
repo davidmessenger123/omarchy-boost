@@ -22,7 +22,7 @@
     "defaultSection": "right",
     "defaults": {
       "maxGHz": "3.0",
-      "presets": "base,3.0,3.5,4.0,turbo",
+      "presets": "",
       "capMax": ""
     },
     "schema": [
@@ -38,8 +38,8 @@
         "key": "presets",
         "type": "string",
         "label": "Presets (comma-separated)",
-        "defaultValue": "base,3.0,3.5,4.0,turbo",
-        "description": "Comma-separated preset chips and right-click cycle steps. Tokens: 'base' (base clock), 'max' (full turbo), or any GHz value like 3.5. Anything over the CPU's reported max is clamped. Also editable in the popup."
+        "defaultValue": "",
+        "description": "Custom preset chips and right-click cycle steps. Empty (default) = auto-generated for the CPU: BASE, evenly-spaced steps up to MAX, so the chips fit the chip's reported range. Tokens: 'base', 'max', or any GHz value like 3.5. Also editable in the popup."
       },
       {
         "key": "capMax",

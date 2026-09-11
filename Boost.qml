@@ -32,9 +32,11 @@ BarWidget {
   // the sysfs truth (`state.max`) so out-of-band changes are always visible.
   property string maxGHz: String(root.effective("maxGHz", "3.0"))
 
-  // User-configurable preset chips, e.g. "base,3.0,3.5,4.0,turbo". Tokens are
-  // base (base clock), turbo/max (full turbo), or a GHz value; order matters.
-  property string presets: String(root.effective("presets", "base,3.0,3.5,4.0,turbo"))
+  // User-configurable preset chips and right-click cycle steps, e.g.
+  // "base,3.4,4.1,turbo". Empty (the default) = auto: evenly-spaced steps
+  // between the reported base and max via adaptivePresetTokens(), so the
+  // chips suit every CPU's actual range instead of a fixed 3.0/3.5/4.0.
+  property string presets: String(root.effective("presets", ""))
 
   // Optional manual ceiling for the max boost, e.g. "4.7". Set when the
   // board/BIOS reports a higher figure than the CPU's rated max (PBO etc.) and
@@ -117,6 +119,25 @@ BarWidget {
 
   // ---- presets ------------------------------------------------------
 
+  // Default chips when no custom list is configured: BASE, evenly-spaced
+  // steps up to MAX. Every CPU gets steps inside its own reported range, so
+  // a 3.8–4.7 GHz chip gets 3.8/4.0/4.3/4.5/4.7 while an Intel 2.6–5.0 gets
+  // 2.6/3.2/3.8/4.4/5.0 — never presets that sit below BASE.
+  function adaptivePresetTokens() {
+    var base = root.baseGHzValue()
+    var max = root.cpuMax()
+    var out = ["base"]
+    if (max > base + 0.01) {
+      var seen = { "base": 1, "turbo": 1 }
+      for (var i = 1; i <= 3; i++) {
+        var key = (Math.round((base + (max - base) * i / 4) * 10) / 10).toFixed(1)
+        if (!seen[key]) { seen[key] = 1; out.push(key) }
+      }
+    }
+    out.push("turbo")
+    return out
+  }
+
   // Shared validator: trims, maps MAX/boost/highest → turbo, clamps numbers to
   // the CPU ceiling, drops junk/duplicates, and never returns an empty set.
   function normalizeTokens(tokens) {
@@ -137,11 +158,15 @@ BarWidget {
       }
       if (!seen[key]) { seen[key] = 1; out.push(key) }
     }
-    return out.length ? out : ["base", "3.0", "3.5", "4.0", "turbo"]
+    // Degrade gracefully instead of guessing fixed 3.0/3.5/4.0 steps.
+    return out.length ? out : root.adaptivePresetTokens()
   }
 
   function presetTokens() {
-    return root.normalizeTokens(String(root.presets || "").split(","))
+    // Empty/unset setting (the default) means "auto per-CPU steps".
+    var raw = String(root.presets || "").trim()
+    if (!raw) return root.adaptivePresetTokens()
+    return root.normalizeTokens(raw.split(","))
   }
 
   function presetLabel(t) {
@@ -530,7 +555,7 @@ BarWidget {
 
         TextField {
           id: presetField
-          text: root.presets
+          text: root.presetTokens().join(",")
           accent: Color.accent
           foreground: Color.foreground
           Layout.fillWidth: true
