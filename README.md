@@ -1,10 +1,10 @@
 # Boost
 
-An Omarchy bar widget that lets you cap — or lift — your CPU's max boost
-clock on the fly.
+An Omarchy bar widget that lets you cap your CPU's max boost clock on the fly.
 
-- **Left click** opens a panel with a continuous slider (1.0–5.0 GHz) and
-  preset chips: **BASE**, **3.0**, **3.5**, **4.0**, **MAX**.
+- **Left click** opens a panel with a continuous slider (1.0 GHz up to the
+  CPU's own reported max boost) and preset chips: **BASE**, **3.0**, **3.5**,
+  **4.0**, **MAX**.
 - **Right click** cycles those presets without opening the panel.
 - **Middle click** re-syncs the readout with sysfs.
 - The bar button shows the live cap (and package temperature in the tooltip).

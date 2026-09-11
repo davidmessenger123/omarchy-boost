@@ -6,7 +6,7 @@
   "version": "1.0.0",
   "author": "David JM",
   "license": "MIT",
-  "description": "Limit or lift your CPU's max boost clock straight from the bar. Left-click opens a slider with quick presets found in the popup; every change applies live to all cores and is re-applied on the next boot.",
+  "description": "Limit your CPU's max boost clock straight from the bar. Left-click opens a slider with quick presets found in the popup; every change applies live to all cores and is re-applied on the next boot.",
   "repository": "https://github.com/davidmessenger123/omarchy-boost",
   "kinds": [
     "bar-widget"

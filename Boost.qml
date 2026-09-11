@@ -5,7 +5,10 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Boost — cap or lift the CPU's max boost clock from the bar.
+// Boost — cap the CPU's max boost clock from the bar. It can never raise a
+// cap above what the CPU reports (an overclocked BIOS would report the
+// overclock as its max), only lower or lift a previously-lowered cap up to
+// that reported ceiling.
 //
 // The widget reads the live cap straight from sysfs (readable by anyone, no
 // elevation needed) and applies changes through boostctl.py, the one program
