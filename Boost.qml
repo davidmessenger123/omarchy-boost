@@ -113,8 +113,10 @@ BarWidget {
   function applyValue(ghz) {
     var n = Number(ghz)
     if (!isFinite(n)) return
-    var turbo = Number(root.state.turbo)
-    if (isFinite(turbo) && turbo > 0) n = Math.min(n, turbo)
+    // The hard ceiling is the CPU's reported turbo; before that loads we never
+    // go above the persisted value. Either way the widget can't ask for more
+    // than the CPU reports, and boostctl.py enforces the same limit at sysfs.
+    n = Math.min(n, root.cpuMax())
     n = Math.max(1.0, Math.round(n * 10) / 10)
     root.dragGHz = -1
     if (applyProcess.running) return
@@ -247,17 +249,6 @@ BarWidget {
         }
 
         Text {
-          text: "CURRENT CAP  " + (root.dragGHz >= 0
-            ? root.fmt(root.dragGHz)
-            : (root.state && root.state.max !== undefined ? root.fmt(root.state.max) : root.fmt(root.maxGHz))) + " GHz"
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
-          Layout.alignment: Qt.AlignLeft
-        }
-
-        Text {
           text: (root.state && root.state.model && root.state.model !== "Unknown CPU"
               ? String(root.state.model) : "CPU")
           color: Color.foreground
@@ -271,10 +262,30 @@ BarWidget {
         Text {
           text: (root.state && root.state.cores ? root.state.cores + " cores" : "")
             + (root.state && root.state.threads ? "/" + root.state.threads + " threads" : "")
-            + (root.state && root.state.base ? " · base " + root.fmt(root.state.base) + " GHz" : "")
           color: Qt.darker(Color.foreground, 1.15)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
+          Layout.alignment: Qt.AlignLeft
+        }
+
+        Text {
+          text: "Base " + (root.state && root.state.base ? root.fmt(root.state.base) : "–") + " GHz"
+            + "   ·   Max boost " + (root.state && root.state.turbo ? root.fmt(root.state.turbo) : "–") + " GHz"
+          color: Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          Layout.alignment: Qt.AlignLeft
+        }
+
+        Text {
+          text: "CURRENT CAP  " + (root.dragGHz >= 0
+            ? root.fmt(root.dragGHz)
+            : (root.state && root.state.max !== undefined ? root.fmt(root.state.max) : root.fmt(root.maxGHz))) + " GHz"
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
           Layout.alignment: Qt.AlignLeft
         }
 
@@ -301,9 +312,7 @@ BarWidget {
         Text {
           text: (root.state && root.state.temp !== undefined && root.state.temp !== null
             ? "Package " + root.fmt(root.state.temp) + "°C" : "Package –°C")
-            + "  ·  full turbo " + (root.state && root.state.turbo
-              ? root.fmt(root.state.turbo) : "–") + " GHz"
-          color: Color.foreground
+          color: Qt.darker(Color.foreground, 1.15)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           Layout.alignment: Qt.AlignLeft

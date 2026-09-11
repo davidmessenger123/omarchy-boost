@@ -35,6 +35,10 @@ def read_int(path):
 
 
 def cap_all(ghz):
+    """Cap every online core, never above that core's own reported maximum
+    (cpuinfo_max_freq). Cores can have individual turbo ceilings, so each one
+    is clamped separately — this is the hard backstop against exceeding what
+    the CPU reports, and it applies to `set`, `apply`, and the boot service."""
     wanted = str(ghz).lower()
     for d in cpu_dirs():
         if wanted == "max":
@@ -42,6 +46,11 @@ def cap_all(ghz):
         else:
             target = int(round(float(wanted) * 1_000_000))
         if target is None:
+            continue
+        ceiling = read_int(os.path.join(d, "cpuinfo_max_freq"))
+        if ceiling is not None:
+            target = min(target, ceiling)
+        if target <= 0:
             continue
         with open(os.path.join(d, "scaling_max_freq"), "w", encoding="utf-8") as fh:
             fh.write(f"{target}\n")

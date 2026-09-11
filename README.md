@@ -67,8 +67,10 @@ system, so effectively any x86 chip works out of the box:
 | base clock ("BASE") | `base_frequency`, else CPPC `nominal_freq` |
 | package temperature | `coretemp` (Intel) / `k10temp` Tctl (AMD) |
 
-The slider and the MAX preset never allow a cap above the CPU's reported
-full-turbo, and `applyValue` clamps anything else down to it as well.
+The slider, the presets, and `applyValue` never allow a cap above the CPU's
+reported full-turbo, and `boostctl.py` enforces the same ceiling per core when
+it writes `scaling_max_freq` — so neither the widget, a manual `set`, nor the
+boot service can ever exceed what the CPU reports.
 
 ## What the installer generates (reference)
 
