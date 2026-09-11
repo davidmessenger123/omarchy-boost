@@ -318,7 +318,7 @@ BarWidget {
     owner: root
     open: root.settingsOpen
     focusTarget: capSlider
-    contentWidth: settingsPanel.fittedContentWidth(Style.space(300))
+    contentWidth: settingsPanel.fittedContentWidth(Style.space(360))
     contentHeight: settingsPanel.fittedContentHeight(form.implicitHeight)
 
     PanelKeyCatcher {
@@ -461,6 +461,8 @@ BarWidget {
           color: Qt.darker(Color.foreground, 1.15)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+          Layout.fillWidth: true
           Layout.alignment: Qt.AlignLeft
           Layout.topMargin: Style.space(4)
         }
