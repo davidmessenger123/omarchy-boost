@@ -260,9 +260,19 @@ BarWidget {
         Text {
           text: (root.state && root.state.model && root.state.model !== "Unknown CPU"
               ? String(root.state.model) : "CPU")
-            + (root.state && root.state.cores ? " · " + root.state.cores + " cores" : "")
-            + (root.state && root.state.threads ? "/" + root.state.threads + " threads" : "")
           color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          wrapMode: Text.Wrap
+          Layout.fillWidth: true
+        }
+
+        Text {
+          text: (root.state && root.state.cores ? root.state.cores + " cores" : "")
+            + (root.state && root.state.threads ? "/" + root.state.threads + " threads" : "")
+            + (root.state && root.state.base ? " · base " + root.fmt(root.state.base) + " GHz" : "")
+          color: Qt.darker(Color.foreground, 1.15)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           Layout.alignment: Qt.AlignLeft
