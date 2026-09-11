@@ -33,6 +33,11 @@ BarWidget {
   // base (base clock), turbo/max (full turbo), or a GHz value; order matters.
   property string presets: String(root.effective("presets", "base,3.0,3.5,4.0,turbo"))
 
+  // Optional manual ceiling for the max boost, e.g. "4.7". Set when the
+  // board/BIOS reports a higher figure than the CPU's rated max (PBO etc.) and
+  // you want "MAX" to mean your own number. Blank = trust the CPU's sysfs.
+  property string capMax: String(root.effective("capMax", ""))
+
   // Set by right-click cycling: once the pending apply lands, fire a desktop
   // notification saying what the new max boost is.
   property bool notifyNext: false
@@ -74,9 +79,18 @@ BarWidget {
   }
 
   // Highest allowed cap: the CPU's reported full-turbo once the state has
-  // loaded; before then we never offer anything above the persisted value,
-  // so the slider can never be dragged past what the CPU reports.
+  // loaded; before then we never offer anything above the persisted value.
+  // A manual `capMax` pins the ceiling below what the board reports when you
+  // want MAX to mean your own number (e.g. a CPU rated 4.7 GHz that a PBO
+  // BIOS reports as 5.0). Either way the widget can't ask for more than the
+  // CPU reports, and boostctl.py enforces the same limit at sysfs.
   function cpuMax() {
+    var over = Number(root.capMax)
+    if (isFinite(over) && over >= 1.0) {
+      var t = Number(root.state.turbo)
+      if (isFinite(t) && t > 0) return Math.min(over, t)
+      return over
+    }
     var t = Number(root.state.turbo)
     if (isFinite(t) && t > 0) return t
     var c = Number(root.maxGHz)
@@ -157,6 +171,23 @@ BarWidget {
     persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "presets": norm })]
     persistProcess.running = true
     root.keyNotice = "Presets saved: " + norm
+  }
+
+  function saveCapMax(norm) {
+    var live = root.selfEntry() || root.settings || {}
+    if (!(live instanceof Object)) live = {}
+    var entry = { "id": "davidjm.boost" }
+    for (var k in live) if (k !== "id") entry[k] = live[k]
+    entry["capMax"] = norm
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+      root.bar.shell.updateEntryInline("davidjm.boost", entry)
+    }
+    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "capMax": norm })]
+    persistProcess.running = true
+    root.keyNotice = norm
+      ? "Manual max set to " + norm + " GHz"
+      : "Manual max cleared (MAX = CPU's own max)"
   }
 
   function toggleSettings() {
@@ -477,6 +508,34 @@ BarWidget {
             var norm = root.normalizeTokens(presetField.text.split(",")).join(",")
             root.savePresets(norm)
             presetField.text = norm
+          }
+        }
+
+        Text {
+          text: "Manual max (GHz, blank = from CPU)"
+          color: Qt.darker(Color.foreground, 1.15)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+          Layout.fillWidth: true
+          Layout.alignment: Qt.AlignLeft
+          Layout.topMargin: Style.space(4)
+        }
+
+        TextField {
+          id: capMaxField
+          text: root.capMax
+          placeholderText: "e.g. 4.7"
+          accent: Color.accent
+          foreground: Color.foreground
+          Layout.fillWidth: true
+          onAccepted: {
+            var t = capMaxField.text.trim()
+            var n = Number(t)
+            var norm = (t === "" || !isFinite(n) || n < 1.0)
+              ? "" : (Math.round(n * 10) / 10).toFixed(1)
+            root.saveCapMax(norm)
+            capMaxField.text = norm
           }
         }
 

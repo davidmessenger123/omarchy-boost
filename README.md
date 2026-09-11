@@ -72,6 +72,30 @@ reported full-turbo, and `boostctl.py` enforces the same ceiling per core when
 it writes `scaling_max_freq` — so neither the widget, a manual `set`, nor the
 boot service can ever exceed what the CPU reports.
 
+## Manual max ceiling (`capMax`)
+
+A CPU's **rated** max boost (e.g. 4.7 GHz on a Ryzen 7 5800X) can read higher
+in sysfs — PBO/BIOS may expose `cpuinfo_max_freq` as 5.0. The widget trusts the
+chip, so "MAX", the slider, and the current cap then follow that higher figure.
+
+If you want "MAX" to mean your own number instead, set the `capMax` setting to
+a fixed GHz value (column "Manual max boost (GHz)"; a "Manual max" field in the
+popup, blank = from CPU). `maxGHz`/`presets` live in the same settings
+location. Example:
+
+```json
+"davidjm.boost": {
+  "id": "davidjm.boost",
+  "maxGHz": "4.7",
+  "presets": "base,3.0,3.5,4.0,max",
+  "capMax": "4.7"
+}
+```
+
+The manual ceiling is still capped at the chip's sysfs max (so it can never be
+set *above* what the hardware allows), and applying MAX with `capMax` set writes
+exactly that value — the "CURRENT CAP" readout then shows 4.7, not 5.0.
+
 ## What the installer generates (reference)
 
 `setup.py` writes these two files with the placeholders already filled in
