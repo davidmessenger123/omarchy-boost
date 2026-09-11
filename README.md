@@ -13,6 +13,30 @@ Changes apply to every online core immediately, persist in the widget's
 shell.json entry, and are re-applied at boot by the `cpu-cap-boost.service`
 systemd unit.
 
+## Install
+
+```sh
+omarchy plugin add https://github.com/davidmessenger123/omarchy-boost.git --enable
+```
+
+The widget needs passwordless root elevation (to write
+`scaling_max_freq`) and a boot service (to re-apply the cap on reboot). A
+small installer writes both for you, deriving your real user and plugin
+path automatically:
+
+```sh
+sudo python3 ~/.config/omarchy/plugins/davidjm.boost/setup.py
+```
+
+(It is idempotent — safe to re-run. Use `--dry-run` to see what it writes
+first.)
+
+Finally add it to the bar:
+
+```sh
+omarchy bar put davidjm.boost --section right
+```
+
 ## How it works
 
 | File | Purpose |
@@ -33,9 +57,12 @@ write directly. The base figure comes from `base_frequency` (Intel / amd-pstate
 ≥ 6.5), falling back to the ACPI CPPC `nominal_freq`; temperature is read from
 `coretemp` on Intel and `k10temp` (Tctl) on AMD.
 
-## One-time setup (needs root)
+## What the installer generates (reference)
 
-1. Install the polkit rule:
+`setup.py` writes these two files with the placeholders already filled in
+from your real user and plugin path:
+
+1. The passwordless polkit rule:
 
    ```js
    // /etc/polkit-1/rules.d/50-davidjm-boost.rules
@@ -49,7 +76,7 @@ write directly. The base figure comes from `base_frequency` (Intel / amd-pstate
    });
    ```
 
-2. Point `cpu-cap-boost.service` at the persisted value:
+2. The boot-persistence systemd unit:
 
    ```ini
    # /etc/systemd/system/cpu-cap-boost.service
@@ -59,16 +86,18 @@ write directly. The base figure comes from `base_frequency` (Intel / amd-pstate
 
    [Service]
    Type=oneshot
-   ExecStart=/home/YOURUSER/.config/omarchy/plugins/davidjm.boost/boostctl.py apply
+   ExecStart=/usr/bin/python3 /home/YOURUSER/.config/omarchy/plugins/davidjm.boost/boostctl.py apply
    RemainAfterExit=yes
 
    [Install]
    WantedBy=multi-user.target
    ```
 
-   then `systemctl daemon-reload && systemctl enable cpu-cap-boost.service`.
+   and enables it (`systemctl enable cpu-cap-boost.service` after a
+   `daemon-reload`).
 
-3. Add to the bar: `omarchy bar put davidjm.boost --section right`.
+   The polkit rule scopes passwordless `pkexec` to **only** this plugin's
+   `boostctl.py`, so nothing else on the system gains rights.
 
 ## Notes
 
