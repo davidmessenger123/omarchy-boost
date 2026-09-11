@@ -75,6 +75,33 @@ def base_freq():
     return None
 
 
+def cpu_info():
+    """Model name, physical cores per socket, and logical thread count from
+    /proc/cpuinfo — vendor-agnostic, so the widget can label itself on
+    basically any x86 (or ARM) machine without a lookup table."""
+    model = "Unknown CPU"
+    cores = None
+    threads = 0
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            for line in fh:
+                key, _, value = line.partition(":")
+                k = key.strip().lower()
+                v = value.strip()
+                if k == "model name" and model == "Unknown CPU":
+                    model = v or model
+                elif k == "cpu cores" and cores is None:
+                    try:
+                        cores = int(v)
+                    except ValueError:
+                        pass
+                elif k == "processor":
+                    threads += 1
+    except OSError:
+        pass
+    return {"model": model, "cores": cores, "threads": threads}
+
+
 def get_state():
     caps, turbos = [], []
     for d in cpu_dirs():
@@ -85,11 +112,15 @@ def get_state():
         if turbo is not None:
             turbos.append(turbo)
     base = base_freq()
+    info = cpu_info()
     return {
         "max": round(min(caps) / 1e6, 1) if caps else None,
         "turbo": round(max(turbos) / 1e6, 1) if turbos else None,
         "base": round(base / 1e6, 1) if base else FALLBACK_BASE_GHZ,
         "temp": package_temp(),
+        "model": info["model"],
+        "cores": info["cores"],
+        "threads": info["threads"],
         "default": persisted(),
     }
 

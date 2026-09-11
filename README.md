@@ -57,6 +57,19 @@ write directly. The base figure comes from `base_frequency` (Intel / amd-pstate
 ≥ 6.5), falling back to the ACPI CPPC `nominal_freq`; temperature is read from
 `coretemp` on Intel and `k10temp` (Tctl) on AMD.
 
+There is **no CPU lookup table** — everything is read live from the running
+system, so effectively any x86 chip works out of the box:
+
+| Reading | Source |
+| --- | --- |
+| model name / cores / threads | `/proc/cpuinfo` (shown in the tooltip and panel) |
+| full-turbo ("MAX") | `cpuinfo_max_freq` per core |
+| base clock ("BASE") | `base_frequency`, else CPPC `nominal_freq` |
+| package temperature | `coretemp` (Intel) / `k10temp` Tctl (AMD) |
+
+The slider and the MAX preset never allow a cap above the CPU's reported
+full-turbo, and `applyValue` clamps anything else down to it as well.
+
 ## What the installer generates (reference)
 
 `setup.py` writes these two files with the placeholders already filled in

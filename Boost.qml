@@ -65,6 +65,17 @@ BarWidget {
     return isFinite(n) ? n.toFixed(1) : "–"
   }
 
+  // Highest allowed cap: the CPU's reported full-turbo once the state has
+  // loaded; before then we never offer anything above the persisted value,
+  // so the slider can never be dragged past what the CPU reports.
+  function cpuMax() {
+    var t = Number(root.state.turbo)
+    if (isFinite(t) && t > 0) return t
+    var c = Number(root.maxGHz)
+    if (isFinite(c) && c > 0) return c
+    return 3.0
+  }
+
   function toggleSettings() {
     root.settingsOpen = !root.settingsOpen
     if (root.settingsOpen) root.keyNotice = ""
@@ -139,8 +150,7 @@ BarWidget {
   function cycleQuick() {
     var base = Number(root.state.base)
     if (!isFinite(base) || base <= 0) base = 2.6
-    var turbo = Number(root.state.turbo)
-    if (!isFinite(turbo) || turbo <= 0) turbo = 5.0
+    var turbo = root.cpuMax()
     var steps = [base, 3.0, 3.5, 4.0, turbo]
     var cur = Number(root.state.max)
     if (!isFinite(cur)) cur = Number(root.maxGHz)
@@ -191,7 +201,8 @@ BarWidget {
     // The label is the button's `text` — WidgetButton only paints/clicks when
     // text is non-empty (`hasVisualContent`), so the glyph + cap go there.
     text: "\uF0E7  " + root.displayMax
-    tooltipText: "Max boost " + root.displayMax + " GHz"
+    tooltipText: (root.state && root.state.model ? root.state.model + " · " : "")
+      + "Max boost " + root.displayMax + " GHz"
       + ((root.state && root.state.temp !== undefined && root.state.temp !== null)
         ? " · " + root.fmt(root.state.temp) + "°C" : "")
       + " — left adjust · right presets · middle refresh"
@@ -246,14 +257,29 @@ BarWidget {
           Layout.alignment: Qt.AlignLeft
         }
 
+        Text {
+          text: (root.state && root.state.model && root.state.model !== "Unknown CPU"
+              ? String(root.state.model) : "CPU")
+            + (root.state && root.state.cores ? " · " + root.state.cores + " cores" : "")
+            + (root.state && root.state.threads ? "/" + root.state.threads + " threads" : "")
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          Layout.alignment: Qt.AlignLeft
+        }
+
         PanelSlider {
           id: capSlider
           bar: root.bar
-          value: root.dragGHz >= 0 ? root.dragGHz
-            : (root.state && root.state.max !== undefined ? Number(root.state.max)
-                : (isFinite(Number(root.maxGHz)) ? Number(root.maxGHz) : 3.0))
+          value: {
+            var cur = root.dragGHz >= 0 ? root.dragGHz
+              : (root.state && root.state.max !== undefined
+                  ? Number(root.state.max)
+                  : (isFinite(Number(root.maxGHz)) ? Number(root.maxGHz) : 3.0))
+            return Math.min(cur, root.cpuMax())
+          }
           minimum: 1.0
-          maximum: Math.max(2.0, Number(root.state.turbo) || 5.0)
+          maximum: root.cpuMax()
           step: 0.1
           tickCount: 5
           Layout.fillWidth: true
@@ -337,7 +363,7 @@ BarWidget {
         onClicked: {
           var v
           if (modelData.value === "base") v = Number(root.state.base) || 2.6
-          else if (modelData.value === "turbo") v = Number(root.state.turbo) || 5.0
+          else if (modelData.value === "turbo") v = root.cpuMax()
           else v = Number(modelData.value)
           root.applyValue(v)
         }
