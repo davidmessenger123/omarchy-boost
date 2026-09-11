@@ -47,6 +47,13 @@
         "label": "Manual max boost (GHz)",
         "defaultValue": "",
         "description": "Pin the usable max-boost ceiling to a fixed value, e.g. 4.7 for a CPU that a PBO BIOS reports higher than its rated max. Blank = trust the CPU's own reported max. Never exceeds the CPU's sysfs max."
+      },
+      {
+        "key": "baseGHz",
+        "type": "string",
+        "label": "Base clock (GHz)",
+        "defaultValue": "",
+        "description": "Manual base clock for the panel and the BASE preset, e.g. 3.8, when sysfs can't report it (acpi-cpufreq Ryzen without CPPC exposes no base_frequency). Blank = auto-detect."
       }
     ]
   }

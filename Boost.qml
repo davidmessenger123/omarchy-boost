@@ -38,6 +38,10 @@ BarWidget {
   // you want "MAX" to mean your own number. Blank = trust the CPU's sysfs.
   property string capMax: String(root.effective("capMax", ""))
 
+  // Optional manual base clock, e.g. "3.8", for CPUs where sysfs can't report
+  // it (acpi-cpufreq Ryzen without CPPC). Blank = auto-detect.
+  property string baseGHz: String(root.effective("baseGHz", ""))
+
   // Set by right-click cycling: once the pending apply lands, fire a desktop
   // notification saying what the new max boost is.
   property bool notifyNext: false
@@ -98,6 +102,16 @@ BarWidget {
     return 3.0
   }
 
+  // Base clock used by the BASE preset/cycle: manual override wins, then
+  // whatever boostctl detected, then a sensible 2.6 last resort.
+  function baseGHzValue() {
+    var o = Number(root.baseGHz)
+    if (isFinite(o) && o > 0) return o
+    var b = Number(root.state.base)
+    if (isFinite(b) && b > 0) return b
+    return 2.6
+  }
+
   // ---- presets ------------------------------------------------------
 
   // Shared validator: trims, maps MAX/boost/highest → turbo, clamps numbers to
@@ -150,7 +164,7 @@ BarWidget {
     var vals = []
     for (var i = 0; i < tokens.length; i++) {
       var t = tokens[i]
-      if (t === "base") vals.push(Number(root.state.base) > 0 ? Number(root.state.base) : 2.6)
+      if (t === "base") vals.push(root.baseGHzValue())
       else if (t === "turbo") vals.push(root.cpuMax())
       else vals.push(Number(t))
     }
@@ -188,6 +202,23 @@ BarWidget {
     root.keyNotice = norm
       ? "Manual max set to " + norm + " GHz"
       : "Manual max cleared (MAX = CPU's own max)"
+  }
+
+  function saveBaseGHz(norm) {
+    var live = root.selfEntry() || root.settings || {}
+    if (!(live instanceof Object)) live = {}
+    var entry = { "id": "davidjm.boost" }
+    for (var k in live) if (k !== "id") entry[k] = live[k]
+    entry["baseGHz"] = norm
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+      root.bar.shell.updateEntryInline("davidjm.boost", entry)
+    }
+    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "baseGHz": norm })]
+    persistProcess.running = true
+    root.keyNotice = norm
+      ? "Base clock set to " + norm + " GHz"
+      : "Base clock cleared (auto-detect)"
   }
 
   function toggleSettings() {
@@ -391,7 +422,9 @@ BarWidget {
         }
 
         Text {
-          text: "Base " + (root.state && root.state.base ? root.fmt(root.state.base) : "–") + " GHz"
+          text: "Base " + (root.baseGHz
+                ? root.fmt(root.baseGHz)
+                : (root.state && root.state.base ? root.fmt(root.state.base) : "–")) + " GHz"
             + "   ·   Max boost " + (root.state && root.state.turbo ? root.fmt(root.state.turbo) : "–") + " GHz"
           color: Color.accent
           font.family: Style.font.family
@@ -540,6 +573,34 @@ BarWidget {
         }
 
         Text {
+          text: "Base clock (GHz, blank = from CPU)"
+          color: Qt.darker(Color.foreground, 1.15)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+          Layout.fillWidth: true
+          Layout.alignment: Qt.AlignLeft
+          Layout.topMargin: Style.space(4)
+        }
+
+        TextField {
+          id: baseField
+          text: root.baseGHz
+          placeholderText: "e.g. 3.8"
+          accent: Color.accent
+          foreground: Color.foreground
+          Layout.fillWidth: true
+          onAccepted: {
+            var t = baseField.text.trim()
+            var n = Number(t)
+            var norm = (t === "" || !isFinite(n) || n < 1.0)
+              ? "" : (Math.round(n * 10) / 10).toFixed(1)
+            root.saveBaseGHz(norm)
+            baseField.text = norm
+          }
+        }
+
+        Text {
           text: root.keyNotice
           visible: root.keyNotice !== ""
           color: Color.popups.text
@@ -586,7 +647,7 @@ BarWidget {
         onExited: hot = false
         onClicked: {
           var v
-          if (modelData.value === "base") v = Number(root.state.base) || 2.6
+          if (modelData.value === "base") v = root.baseGHzValue()
           else if (modelData.value === "turbo") v = root.cpuMax()
           else v = Number(modelData.value)
           root.applyValue(v)

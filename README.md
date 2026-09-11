@@ -96,6 +96,24 @@ The manual ceiling is still capped at the chip's sysfs max (so it can never be
 set *above* what the hardware allows), and applying MAX with `capMax` set writes
 exactly that value — the "CURRENT CAP" readout then shows 4.7, not 5.0.
 
+## Manual base clock (`baseGHz`)
+
+The base-clock line and the BASE preset detect the base from `base_frequency`
+(Intel / amd-pstate ≥ 6.5) or ACPI CPPC `nominal_freq`. On `acpi-cpufreq` Ryzen
+without CPPC there is no sysfs base at all; the panel then shows "Base –". Set a
+fixed value in the popup's "Base clock (GHz)" field (blank = auto-detect) to
+show and cap BASE at your CPU's real base clock, e.g. 3.8 on a 5800X:
+
+```json
+"davidjm.boost": {
+  "id": "davidjm.boost",
+  "maxGHz": "4.7",
+  "presets": "base,3.0,3.5,4.0,max",
+  "capMax": "4.7",
+  "baseGHz": "3.8"
+}
+```
+
 ## What the installer generates (reference)
 
 `setup.py` writes these two files with the placeholders already filled in

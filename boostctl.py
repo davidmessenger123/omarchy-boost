@@ -19,7 +19,6 @@ import sys
 
 CPU_ROOT = "/sys/devices/system/cpu"
 PERSIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maxboost")
-FALLBACK_BASE_GHZ = 2.6
 
 
 def cpu_dirs():
@@ -125,7 +124,7 @@ def get_state():
     return {
         "max": round(min(caps) / 1e6, 1) if caps else None,
         "turbo": round(max(turbos) / 1e6, 1) if turbos else None,
-        "base": round(base / 1e6, 1) if base else FALLBACK_BASE_GHZ,
+        "base": round(base / 1e6, 1) if base else None,
         "temp": package_temp(),
         "model": info["model"],
         "cores": info["cores"],
