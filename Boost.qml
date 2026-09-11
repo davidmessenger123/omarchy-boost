@@ -171,54 +171,57 @@ BarWidget {
     return vals
   }
 
-  function savePresets(norm) {
-    // Push into this widget's own settings immediately, like persistValue does.
-    var live = root.selfEntry() || root.settings || {}
-    if (!(live instanceof Object)) live = {}
-    var entry = { "id": "davidjm.boost" }
-    for (var k in live) if (k !== "id") entry[k] = live[k]
-    entry["presets"] = norm
-    root.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
-      root.bar.shell.updateEntryInline("davidjm.boost", entry)
+  // Build the widget's full entry as the UNION of the runtime settings and the
+  // bar layoutConfig, plus this change. layoutConfig can lag behind what the
+  // user just typed (the shell rebuilds it on file-watch), so reading only one
+  // of the two would silently drop sibling keys like capMax/baseGHz/presets on
+  // the next single-key write.
+  function mergedEntry(changes) {
+    var live = {}
+    // Start from the bar layoutConfig (the on-disk view)…
+    var self = root.selfEntry()
+    if (self instanceof Object) {
+      for (var s in self) live[s] = self[s]
     }
-    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "presets": norm })]
+    // …then overlay the runtime settings: if they disagree, memory is newer
+    // (it was just written by an earlier apply/save and the shell hasn't
+    // re-injected the file-backed view yet).
+    var setting = root.settings
+    if (setting instanceof Object) {
+      for (var k in setting) live[k] = setting[k]
+    }
+    for (var c in changes) live[c] = changes[c]
+    var entry = { "id": "davidjm.boost" }
+    for (var e in live) if (e !== "id") entry[e] = live[e]
+    return entry
+  }
+
+  // Push the unioned entry into both runtime settings and disk. Writing the
+  // whole entry every time (rather than one changed key) makes each save
+  // self-contained, so nothing can ever be dropped because a previous write
+  // wasn't picked up yet.
+  function applySettingsEntry(changes, notice) {
+    var entry = root.mergedEntry(changes)
+    root.settings = entry
+    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify(entry)]
     persistProcess.running = true
-    root.keyNotice = "Presets saved: " + norm
+    if (notice) root.keyNotice = notice
+  }
+
+  function savePresets(norm) {
+    root.applySettingsEntry({ "presets": norm }, "Presets saved: " + norm)
   }
 
   function saveCapMax(norm) {
-    var live = root.selfEntry() || root.settings || {}
-    if (!(live instanceof Object)) live = {}
-    var entry = { "id": "davidjm.boost" }
-    for (var k in live) if (k !== "id") entry[k] = live[k]
-    entry["capMax"] = norm
-    root.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
-      root.bar.shell.updateEntryInline("davidjm.boost", entry)
-    }
-    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "capMax": norm })]
-    persistProcess.running = true
-    root.keyNotice = norm
+    root.applySettingsEntry({ "capMax": norm }, norm
       ? "Manual max set to " + norm + " GHz"
-      : "Manual max cleared (MAX = CPU's own max)"
+      : "Manual max cleared (MAX = CPU's own max)")
   }
 
   function saveBaseGHz(norm) {
-    var live = root.selfEntry() || root.settings || {}
-    if (!(live instanceof Object)) live = {}
-    var entry = { "id": "davidjm.boost" }
-    for (var k in live) if (k !== "id") entry[k] = live[k]
-    entry["baseGHz"] = norm
-    root.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
-      root.bar.shell.updateEntryInline("davidjm.boost", entry)
-    }
-    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "baseGHz": norm })]
-    persistProcess.running = true
-    root.keyNotice = norm
+    root.applySettingsEntry({ "baseGHz": norm }, norm
       ? "Base clock set to " + norm + " GHz"
-      : "Base clock cleared (auto-detect)"
+      : "Base clock cleared (auto-detect)")
   }
 
   function toggleSettings() {
@@ -280,18 +283,9 @@ BarWidget {
     var cap = Number(ghz).toFixed(1)
     // Push the value into this widget's own settings immediately so the button
     // and slider reflect it without waiting for the shell's shell.json watch.
-    var live = root.selfEntry() || root.settings || {}
-    if (!(live instanceof Object)) live = {}
-    var entry = { "id": "davidjm.boost" }
-    for (var k in live) if (k !== "id") entry[k] = live[k]
-    entry["maxGHz"] = cap
-    root.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
-      root.bar.shell.updateEntryInline("davidjm.boost", entry)
-    }
-    // Persist to disk for the boot service and the settings editor.
-    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "maxGHz": cap })]
-    persistProcess.running = true
+    // The full unioned entry is persisted so a cap change never drops any of
+    // the other settings (presets, capMax, baseGHz) that share the entry.
+    root.applySettingsEntry({ "maxGHz": cap })
   }
 
   // Right-click cycle: step up through the configured presets in order; after
