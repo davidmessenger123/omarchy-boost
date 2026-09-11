@@ -400,6 +400,43 @@ BarWidget {
           onReleased: root.applyValue(value)
         }
 
+        // Scale labels: the left end is always 1.0, the right end always means
+        // "the CPU's full turbo" (variable per CPU), so it reads MAX instead of
+        // a hardcoded number like 5.0.
+        RowLayout {
+          Layout.topMargin: Style.space(2)
+          Layout.fillWidth: true
+          spacing: 0
+
+          Text {
+            text: "1.0"
+            Layout.fillWidth: true
+            Layout.rightMargin: Style.space(4)
+            horizontalAlignment: Text.AlignLeft
+            color: Qt.darker(Color.foreground, 1.15)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            text: root.fmt((1.0 + root.cpuMax()) / 2)
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignHCenter
+            color: Qt.darker(Color.foreground, 1.15)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            text: "MAX"
+            Layout.fillWidth: true
+            Layout.leftMargin: Style.space(4)
+            horizontalAlignment: Text.AlignRight
+            color: Qt.darker(Color.foreground, 1.15)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+        }
+
         Text {
           text: (root.state && root.state.temp !== undefined && root.state.temp !== null
             ? "Package " + root.fmt(root.state.temp) + "°C" : "Package –°C")

@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Boost",
-    "description": "A bolt glyph showing the current max boost cap. Left-click opens a continuous slider (1.0–5.0 GHz), editable preset chips (BASE, any GHz values, MAX), and live package temperature. Changes apply immediately to every core via a passwordless polkit helper and persist across reboots. Right-click cycles the presets on the fly and pops a notification with the new cap; middle-click re-syncs the readout with sysfs.",
+    "description": "A bolt glyph showing the current max boost cap. Left-click opens a continuous slider (1.0 GHz up to the CPU's own max boost, labelled MAX), editable preset chips (BASE, any GHz values, MAX), and live package temperature. Changes apply immediately to every core via a passwordless polkit helper and persist across reboots. Right-click cycles the presets on the fly and pops a notification with the new cap; middle-click re-syncs the readout with sysfs.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
