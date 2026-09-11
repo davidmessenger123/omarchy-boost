@@ -29,6 +29,14 @@ BarWidget {
   // the sysfs truth (`state.max`) so out-of-band changes are always visible.
   property string maxGHz: String(root.effective("maxGHz", "3.0"))
 
+  // User-configurable preset chips, e.g. "base,3.0,3.5,4.0,turbo". Tokens are
+  // base (base clock), turbo/max (full turbo), or a GHz value; order matters.
+  property string presets: String(root.effective("presets", "base,3.0,3.5,4.0,turbo"))
+
+  // Set by right-click cycling: once the pending apply lands, fire a desktop
+  // notification saying what the new max boost is.
+  property bool notifyNext: false
+
   // Live board state, parsed from `boostctl.py get`.
   property var state: ({})
 
@@ -76,6 +84,81 @@ BarWidget {
     return 3.0
   }
 
+  // ---- presets ------------------------------------------------------
+
+  // Shared validator: trims, maps MAX/boost/highest → turbo, clamps numbers to
+  // the CPU ceiling, drops junk/duplicates, and never returns an empty set.
+  function normalizeTokens(tokens) {
+    var seen = {}
+    var out = []
+    for (var i = 0; i < tokens.length; i++) {
+      var t = String(tokens[i]).trim().toLowerCase()
+      if (!t) continue
+      var key
+      if (t === "base") key = "base"
+      else if (t === "turbo" || t === "max" || t === "boost" || t === "highest") key = "turbo"
+      else {
+        var n = Number(t)
+        if (!isFinite(n) || n <= 0) continue
+        n = Math.max(1.0, Math.min(n, root.cpuMax()))
+        n = Math.round(n * 10) / 10
+        key = n.toFixed(1)
+      }
+      if (!seen[key]) { seen[key] = 1; out.push(key) }
+    }
+    return out.length ? out : ["base", "3.0", "3.5", "4.0", "turbo"]
+  }
+
+  function presetTokens() {
+    return root.normalizeTokens(String(root.presets || "").split(","))
+  }
+
+  function presetLabel(t) {
+    if (t === "base") return "BASE"
+    if (t === "turbo") return "MAX"
+    return t
+  }
+
+  // Chip row model: {label, value} in the user's configured order.
+  function presetChips() {
+    var tokens = root.presetTokens()
+    var chips = []
+    for (var i = 0; i < tokens.length; i++) {
+      chips.push({ "label": root.presetLabel(tokens[i]), "value": tokens[i] })
+    }
+    return chips
+  }
+
+  // Cycle steps: tokens resolved to real GHz at the moment of the click, so the
+  // BASE/MAX targets always reflect the live board state.
+  function presetValues() {
+    var tokens = root.presetTokens()
+    var vals = []
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i]
+      if (t === "base") vals.push(Number(root.state.base) > 0 ? Number(root.state.base) : 2.6)
+      else if (t === "turbo") vals.push(root.cpuMax())
+      else vals.push(Number(t))
+    }
+    return vals
+  }
+
+  function savePresets(norm) {
+    // Push into this widget's own settings immediately, like persistValue does.
+    var live = root.selfEntry() || root.settings || {}
+    if (!(live instanceof Object)) live = {}
+    var entry = { "id": "davidjm.boost" }
+    for (var k in live) if (k !== "id") entry[k] = live[k]
+    entry["presets"] = norm
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+      root.bar.shell.updateEntryInline("davidjm.boost", entry)
+    }
+    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify({ "presets": norm })]
+    persistProcess.running = true
+    root.keyNotice = "Presets saved: " + norm
+  }
+
   function toggleSettings() {
     root.settingsOpen = !root.settingsOpen
     if (root.settingsOpen) root.keyNotice = ""
@@ -112,14 +195,14 @@ BarWidget {
 
   function applyValue(ghz) {
     var n = Number(ghz)
-    if (!isFinite(n)) return
+    if (!isFinite(n)) return false
     // The hard ceiling is the CPU's reported turbo; before that loads we never
     // go above the persisted value. Either way the widget can't ask for more
     // than the CPU reports, and boostctl.py enforces the same limit at sysfs.
     n = Math.min(n, root.cpuMax())
     n = Math.max(1.0, Math.round(n * 10) / 10)
     root.dragGHz = -1
-    if (applyProcess.running) return
+    if (applyProcess.running) return false
     applyProcess.command = ["pkexec", root.pluginDir + "boostctl.py", "set", n.toFixed(1)]
     applyProcess.running = true
     root.persistValue(n)
@@ -128,6 +211,7 @@ BarWidget {
     fresh.max = n
     root.state = fresh
     root.keyNotice = "Applying " + root.fmt(n) + " GHz…"
+    return true
   }
 
   function persistValue(ghz) {
@@ -148,18 +232,19 @@ BarWidget {
     persistProcess.running = true
   }
 
-  // Right-click cycle: BASE → 3.0 → 3.5 → 4.0 → MAX → BASE.
+  // Right-click cycle: step up through the configured presets in order; after
+  // the last usable one, wrap back to the first.
   function cycleQuick() {
-    var base = Number(root.state.base)
-    if (!isFinite(base) || base <= 0) base = 2.6
-    var turbo = root.cpuMax()
-    var steps = [base, 3.0, 3.5, 4.0, turbo]
+    root.notifyNext = false
+    var steps = root.presetValues()
     var cur = Number(root.state.max)
     if (!isFinite(cur)) cur = Number(root.maxGHz)
+    var target = null
     for (var i = 0; i < steps.length; i++) {
-      if (steps[i] > cur + 0.01) { root.applyValue(steps[i]); return }
+      if (steps[i] > cur + 0.01) { target = steps[i]; break }
     }
-    root.applyValue(base)
+    if (target === null) target = steps.length ? steps[0] : root.cpuMax()
+    if (root.applyValue(target)) root.notifyNext = true
   }
 
   Timer { id: poller; interval: 2000; repeat: true; running: true; onTriggered: root.refreshState() }
@@ -170,6 +255,12 @@ BarWidget {
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.keyNotice = "Boost capped at " + root.fmt(root.state.max) + " GHz."
+        if (root.notifyNext) {
+          root.notifyNext = false
+          Quickshell.execDetached(["omarchy-notification-send", "Boost",
+            "Max boost set to " + root.fmt(root.state.max) + " GHz",
+            "-g", "\uf0e7", "--app-name", "davidjm.boost", "-t", "4000"])
+        }
         pendingPoll.restart()
       } else {
         root.keyNotice = "Apply failed — is the polkit rule installed?"
@@ -323,14 +414,30 @@ BarWidget {
           Layout.topMargin: Style.space(6)
 
           Repeater {
-            model: [
-              { "label": "BASE", "value": "base" },
-              { "label": "3.0", "value": 3.0 },
-              { "label": "3.5", "value": 3.5 },
-              { "label": "4.0", "value": 4.0 },
-              { "label": "MAX", "value": "turbo" }
-            ]
+            model: root.presetChips()
             delegate: chip
+          }
+        }
+
+        Text {
+          text: "Presets (comma-separated: BASE, GHz values, MAX)"
+          color: Qt.darker(Color.foreground, 1.15)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          Layout.alignment: Qt.AlignLeft
+          Layout.topMargin: Style.space(4)
+        }
+
+        TextField {
+          id: presetField
+          text: root.presets
+          accent: Color.accent
+          foreground: Color.foreground
+          Layout.fillWidth: true
+          onAccepted: {
+            var norm = root.normalizeTokens(presetField.text.split(",")).join(",")
+            root.savePresets(norm)
+            presetField.text = norm
           }
         }
 

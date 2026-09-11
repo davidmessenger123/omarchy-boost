@@ -16,12 +16,13 @@
   },
   "barWidget": {
     "displayName": "Boost",
-    "description": "A bolt glyph showing the current max boost cap. Left-click opens a continuous slider (1.0–5.0 GHz) plus preset chips — BASE, 3.0, 3.5, 4.0, MAX — and live package temperature. Changes apply immediately to every core via a passwordless polkit helper and persist across reboots (re-applied at boot by cpu-cap-boost.service). Right-click cycles the same presets on the fly; middle-click re-syncs the readout with sysfs.",
+    "description": "A bolt glyph showing the current max boost cap. Left-click opens a continuous slider (1.0–5.0 GHz), editable preset chips (BASE, any GHz values, MAX), and live package temperature. Changes apply immediately to every core via a passwordless polkit helper and persist across reboots. Right-click cycles the presets on the fly and pops a notification with the new cap; middle-click re-syncs the readout with sysfs.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "maxGHz": "3.0"
+      "maxGHz": "3.0",
+      "presets": "base,3.0,3.5,4.0,turbo"
     },
     "schema": [
       {
@@ -31,6 +32,13 @@
         "options": ["2.6", "3.0", "3.5", "4.0", "5.0"],
         "defaultValue": "3.0",
         "description": "Max boost cap. Set live with the popup slider (any 1.0–5.0 GHz value); the last-applied value is persisted and re-applied by the cpu-cap-boost.service systemd unit on boot."
+      },
+      {
+        "key": "presets",
+        "type": "string",
+        "label": "Presets (comma-separated)",
+        "defaultValue": "base,3.0,3.5,4.0,turbo",
+        "description": "Comma-separated preset chips and right-click cycle steps. Tokens: 'base' (base clock), 'max' (full turbo), or any GHz value like 3.5. Anything over the CPU's reported max is clamped. Also editable in the popup."
       }
     ]
   }
