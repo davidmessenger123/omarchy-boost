@@ -193,12 +193,15 @@ def package_temp(hwmon_root="/sys/class/hwmon"):
 
 
 def write_state(state_file, state):
-    """Atomically write the state JSON; a reader (FileView inotify) never sees
-    a half-written file."""
-    tmp = f"{state_file}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    """Write the state JSON in place. The bar's FileView watches via
+    QFileSystemWatcher, which binds to the file's inode; a tmp+rename swap
+    would orphan the watcher on the first rewrite and freeze the readout.
+    The write takes microseconds, so a reader that catches a partial file
+    simply parses the next tick."""
+    with open(state_file, "w", encoding="utf-8") as fh:
         json.dump(state, fh)
-    os.replace(tmp, state_file)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def monitor(state_file, interval=2.0):
