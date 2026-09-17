@@ -272,16 +272,40 @@ BarWidget {
 
   // --------------------------------------------------------------- state sync
 
+  // Middle-click "re-read": force the state FileView to re-read its file now.
+  // The monitor daemon keeps it refreshed every 2 s, so this is mostly for
+  // immediacy after an out-of-band change.
   function refreshState() {
-    if (stateProcess.running) return
-    stateProcess.command = ["python3", root.pluginDir + "boostctl.py", "get"]
-    stateProcess.running = true
+    stateFile.reload()
   }
 
   function parseState(text) {
     var json = {}
     try { json = JSON.parse(text) } catch (e) { json = {} }
     if (json.max !== undefined) root.state = json
+  }
+
+  // A release that lands while the previous `set` is still in flight is queued
+  // here and applied as soon as that pkexec exits, so a quick re-drag can't
+  // drop the newer cap.
+  property real pendingGHz: -1
+
+  // Is the root-owned helper installed (/usr/libexec)? The polkit rule only
+  // authorizes that copy (installed by setup.py), never the user-writable
+  // plugin-dir script. Probe it once; fall back to the plugin copy for
+  // installs that haven't run setup yet.
+  property bool installedHelper: false
+  FileView {
+    id: helperProbe
+    path: "/usr/libexec/davidjm-boost/boostctl.py"
+    printErrors: false
+    onLoaded: root.installedHelper = true
+  }
+
+  function boostctlScript() {
+    return root.installedHelper
+      ? "/usr/libexec/davidjm-boost/boostctl.py"
+      : root.pluginDir + "boostctl.py"
   }
 
   // ------------------------------------------------------------------- apply
@@ -295,8 +319,17 @@ BarWidget {
     n = Math.min(n, root.cpuMax())
     n = Math.max(1.0, Math.round(n * 10) / 10)
     root.dragGHz = -1
-    if (applyProcess.running) return false
-    applyProcess.command = ["pkexec", root.pluginDir + "boostctl.py", "set", n.toFixed(1)]
+    if (applyProcess.running) {
+      // A previous apply is in flight — remember the newest request.
+      root.pendingGHz = n
+      return true
+    }
+    root.startApply(n)
+    return true
+  }
+
+  function startApply(n) {
+    applyProcess.command = ["pkexec", root.boostctlScript(), "set", n.toFixed(1)]
     applyProcess.running = true
     root.persistValue(n)
     // Optimistically mirror the new cap into the readout before the poll lands.
@@ -304,7 +337,6 @@ BarWidget {
     fresh.max = n
     root.state = fresh
     root.keyNotice = "Applying " + root.fmt(n) + " GHz…"
-    return true
   }
 
   function persistValue(ghz) {
@@ -331,12 +363,18 @@ BarWidget {
     if (root.applyValue(target)) root.notifyNext = true
   }
 
-  Timer { id: poller; interval: 2000; repeat: true; running: true; onTriggered: root.refreshState() }
-  Timer { id: pendingPoll; interval: 500; repeat: false; onTriggered: root.refreshState() }
+  // State arrives from the monitor daemon's state file (see below).
 
   Process {
     id: applyProcess
     onExited: function(exitCode) {
+      if (root.pendingGHz >= 0) {
+        // A newer cap came in while this one was applying — chain it now.
+        var next = root.pendingGHz
+        root.pendingGHz = -1
+        root.startApply(next)
+        return
+      }
       if (exitCode === 0) {
         root.keyNotice = "Boost capped at " + root.fmt(root.state.max) + " GHz."
         if (root.notifyNext) {
@@ -345,7 +383,6 @@ BarWidget {
             "Max boost set to " + root.fmt(root.state.max) + " GHz",
             "-g", "\uf0e7", "--app-name", "davidjm.boost", "-t", "4000"])
         }
-        pendingPoll.restart()
       } else {
         root.keyNotice = "Apply failed — is the polkit rule installed?"
       }
@@ -354,12 +391,28 @@ BarWidget {
 
   Process { id: persistProcess }
 
+  // One long-lived `boostctl.py monitor` writes the board state to a file
+  // every 2 s; a FileView watches it. This replaces the old design that
+  // spawned a brand-new `python3 boostctl.py get` every 2 s (~43k processes a
+  // day), with no extra spawns, no unbounded stdout buffering, and instant
+  // first state at startup. Restart with a debounce if the daemon ever dies.
+  readonly property string statePath: "/tmp/davidjm-boost-state.json"
+
   Process {
-    id: stateProcess
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.parseState(text)
-    }
+    id: monitorProc
+    command: ["python3", root.pluginDir + "boostctl.py", "monitor",
+              "--state-file", root.statePath, "--persist-dir", root.pluginDir]
+    running: true
+    onExited: monitorRestart.restart()
+  }
+  Timer { id: monitorRestart; interval: 3000; onTriggered: monitorProc.running = true }
+
+  FileView {
+    id: stateFile
+    path: root.statePath
+    watchChanges: true
+    printErrors: false
+    onTextChanged: root.parseState(stateFile.text)
   }
 
   Component.onCompleted: root.refreshState()

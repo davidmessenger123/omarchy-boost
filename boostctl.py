@@ -6,19 +6,39 @@ Subcommands (from the Boost bar widget):
   set <N.m>    Cap all online cores to N GHz; "max" -> cpuinfo_max_freq.
   apply        Apply the value persisted in ./maxboost (see README); used by
                cpu-cap-boost.service on boot.
+  monitor      Write the board state as JSON to a file every 2 s (option
+               --state-file); the bar widget watches that file instead of
+               spawning `get` twice a second. Never exits.
+
+Options:
+  --persist-dir DIR   Where maxboost lives (default: next to this script).
+                      The root-owned copy under /usr/libexec uses the user's
+                      plugin dir so the boot service reads the same cap the
+                      widget persisted.
 
 `set`/`apply` write /sys/devices/system/cpu, which needs root — the widget
 invokes them with `pkexec`, and a polkit rule grants this exact script
 passwordless elevation (see /etc/polkit-1/rules.d/50-davidjm-boost.rules).
 """
 
+import argparse
 import glob
 import json
 import os
 import sys
+import time
 
 CPU_ROOT = "/sys/devices/system/cpu"
 PERSIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maxboost")
+
+
+def set_persist_dir(plugin_dir):
+    """Point maxboost at the real user-writable plugin dir (the root-owned
+    /usr/libexec copy can't write its own)."""
+    global PERSIST_PATH
+    if plugin_dir:
+        PERSIST_PATH = os.path.join(plugin_dir, "maxboost")
+    return PERSIST_PATH
 
 
 def cpu_dirs():
@@ -39,11 +59,15 @@ def cap_all(ghz):
     is clamped separately — this is the hard backstop against exceeding what
     the CPU reports, and it applies to `set`, `apply`, and the boot service."""
     wanted = str(ghz).lower()
+    try:
+        wanted_hz = None if wanted == "max" else int(round(float(wanted) * 1_000_000))
+    except ValueError as exc:
+        raise ValueError(f"invalid boost cap: {ghz!r}") from exc
     for d in cpu_dirs():
-        if wanted == "max":
+        if wanted_hz is None:
             target = read_int(os.path.join(d, "cpuinfo_max_freq"))
         else:
-            target = int(round(float(wanted) * 1_000_000))
+            target = wanted_hz
         if target is None:
             continue
         ceiling = read_int(os.path.join(d, "cpuinfo_max_freq"))
@@ -121,8 +145,12 @@ def get_state():
             turbos.append(turbo)
     base = base_freq()
     info = cpu_info()
+    # Hybrid P+E CPUs: efficiency cores report a lower native turbo, so every
+    # core capped at the user's value would make min(caps) read back the small
+    # E-core ceiling. The cap that matters is what the top (P) cores hold.
+    max_cap = max(caps) if caps else None
     return {
-        "max": round(min(caps) / 1e6, 1) if caps else None,
+        "max": round(max_cap / 1e6, 1) if max_cap else None,
         "turbo": round(max(turbos) / 1e6, 1) if turbos else None,
         "base": round(base / 1e6, 1) if base else None,
         "temp": package_temp(),
@@ -164,17 +192,62 @@ def package_temp(hwmon_root="/sys/class/hwmon"):
     return None
 
 
-def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "get":
+def write_state(state_file, state):
+    """Atomically write the state JSON; a reader (FileView inotify) never sees
+    a half-written file."""
+    tmp = f"{state_file}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, state_file)
+
+
+def monitor(state_file, interval=2.0):
+    """Long-lived state pump for the bar widget: one process instead of a `get`
+    spawn every tick. First write lands immediately so the readout isn't blank
+    at login; transient sysfs hiccups keep the loop alive."""
+    while True:
+        try:
+            write_state(state_file, get_state())
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
+def main(argv=None):
+    args = argv if argv is not None else sys.argv[1:]
+    ap = argparse.ArgumentParser(prog="boostctl.py", description=__doc__)
+    ap.add_argument("--persist-dir", default=None, help="dir holding maxboost")
+    ap.add_argument("--state-file", default=None, help="monitor JSON output path")
+    ap.add_argument("command", nargs="?", choices=["get", "set", "apply", "monitor"])
+    ap.add_argument("value", nargs="?")
+    parsed = ap.parse_args(args)
+
+    set_persist_dir(parsed.persist_dir)
+
+    if parsed.command == "get":
         print(json.dumps(get_state()))
-    elif cmd == "set":
-        ghz = sys.argv[2] if len(sys.argv) > 2 else persisted()
-        cap_all(ghz)
-    elif cmd == "apply":
+    elif parsed.command == "set":
+        ghz = parsed.value if parsed.value is not None else persisted()
+        try:
+            if str(ghz).lower() != "max":
+                float(ghz)
+        except ValueError:
+            print(f"invalid boost cap: {ghz!r}", file=sys.stderr)
+            sys.exit(2)
+        try:
+            cap_all(ghz)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
+    elif parsed.command == "apply":
         cap_all(persisted())
+    elif parsed.command == "monitor":
+        if not parsed.state_file:
+            print("monitor needs --state-file", file=sys.stderr)
+            sys.exit(2)
+        monitor(parsed.state_file)
     else:
-        print("usage: boostctl.py get | set <GHz|max> | apply", file=sys.stderr)
+        ap.print_usage(sys.stderr)
         sys.exit(2)
 
 

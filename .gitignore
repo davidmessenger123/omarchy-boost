@@ -1,2 +1,5 @@
 # Runtime state: written on every cap change by persist.py; not source.
 maxboost
+
+# Python bytecode.
+__pycache__/

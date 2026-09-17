@@ -25,15 +25,27 @@ STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maxboost"
 def main() -> None:
     if len(sys.argv) < 2 or not sys.argv[1].strip():
         return
-    changes = json.loads(sys.argv[1])
+    try:
+        changes = json.loads(sys.argv[1])
+    except ValueError as exc:
+        print(f"invalid JSON payload: {exc}", file=sys.stderr)
+        sys.exit(1)
     changes.pop("id", None)
 
     if "maxGHz" in changes:
-        with open(STORE_PATH, "w", encoding="utf-8") as fh:
-            fh.write(str(changes["maxGHz"]) + "\n")
+        try:
+            with open(STORE_PATH, "w", encoding="utf-8") as fh:
+                fh.write(str(changes["maxGHz"]) + "\n")
+        except OSError as exc:
+            print(f"couldn't write {STORE_PATH}: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-    with open(CONFIG_PATH, encoding="utf-8") as fh:
-        data = json.load(fh)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"couldn't read {CONFIG_PATH}: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     found = False
 
