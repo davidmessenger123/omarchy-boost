@@ -412,7 +412,7 @@ BarWidget {
     path: root.statePath
     watchChanges: true
     printErrors: false
-    onTextChanged: root.parseState(stateFile.text)
+    onTextChanged: root.parseState(stateFile.text())
   }
 
   Component.onCompleted: root.refreshState()
