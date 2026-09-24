@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or remove the root-owned Boost helper, polkit rule, and boot unit."""
+"""Install or remove the root-owned Boost helper, polkit rule, and monitor unit."""
 
 import argparse
 import errno
@@ -12,15 +12,20 @@ import secrets
 import stat
 import subprocess
 import sys
+import time
 
 POLKIT_RULE = "/etc/polkit-1/rules.d/50-davidjm-boost.rules"
 SYSTEMD_UNIT = "/etc/systemd/system/cpu-cap-boost.service"
 HELPER_DIR = "/usr/local/libexec/omarchy-boost"
 HELPER_PATH = os.path.join(HELPER_DIR, "boostset.py")
+DAEMON_PATH = os.path.join(HELPER_DIR, "boostmonitord.py")
 STATE_DIR = "/var/lib/omarchy-boost"
 STATE_PATH = os.path.join(STATE_DIR, "maxboost")
+POLICY_PATH = STATE_PATH + ".policy"
+UNINSTALL_PATH = os.path.join(STATE_DIR, ".uninstall")
+RUNTIME_DIR = "/run/omarchy-boost"
 MAX_SOURCE_BYTES = 1 << 20
-HELPER_SHA256 = "61f92f139101544ce50af9cf5eb128a172d471cf4bb90cc59638154cb1ef841c"
+HELPER_SHA256 = "36cc194982afad24fe8d7bf6c44c7e050bca9cdd32d02b56d756744eb2b534a1"
 USER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$")
 
 
@@ -108,7 +113,7 @@ def _check_target(path):
         info = os.lstat(path)
     except FileNotFoundError:
         return None
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > MAX_SOURCE_BYTES:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > MAX_SOURCE_BYTES or stat.S_IMODE(info.st_mode) & 0o022:
         raise RuntimeError(f"refusing unsafe existing file: {path}")
     return stat.S_IMODE(info.st_mode)
 
@@ -188,7 +193,9 @@ def read_helper_source(path):
 
 
 def install_helper(data):
-    write(HELPER_PATH, data.decode("utf-8"), 0o755)
+    source = data.decode("utf-8")
+    write(HELPER_PATH, source, 0o755)
+    write(DAEMON_PATH, source, 0o755)
 
 
 def polkit_rule(user, helper=HELPER_PATH):
@@ -205,24 +212,28 @@ def polkit_rule(user, helper=HELPER_PATH):
 """
 
 
-def systemd_unit(helper=HELPER_PATH):
+def systemd_unit(helper=DAEMON_PATH):
     helper_value = helper.replace("\\", "\\\\").replace(" ", "\\x20")
     return f"""[Unit]
-Description=Apply persisted CPU max-boost cap
+Description=Monitor and apply CPU boost policy
 After=multi-user.target
-ConditionPathExists={STATE_DIR}/maxboost
 
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 -I {helper_value} apply
-RemainAfterExit=yes
+Type=simple
+ExecStart=/usr/bin/python3 -I {helper_value} run
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=omarchy-boost
+RuntimeDirectoryMode=0755
+StateDirectory=omarchy-boost
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateTmp=yes
 PrivateNetwork=yes
 ProtectSystem=strict
-ReadWritePaths=-/sys/devices/system/cpu -/var/lib/omarchy-boost
+ReadWritePaths=-/sys/devices/system/cpu -/var/lib/omarchy-boost -/run/omarchy-boost
 ProtectHome=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
@@ -265,11 +276,35 @@ def _cleanup_state():
     _verify_root_dir(STATE_DIR)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
         raise RuntimeError(f"refusing unsafe state directory: {STATE_DIR}")
-    for path in (STATE_PATH, STATE_PATH + ".lock"):
+    for path in (STATE_PATH, POLICY_PATH, STATE_PATH + ".lock", UNINSTALL_PATH):
         _remove_file(path)
     try:
         os.rmdir(STATE_DIR)
         print(f"removed {STATE_DIR}")
+    except OSError as exc:
+        if exc.errno != errno.ENOTEMPTY:
+            raise
+
+
+def _cleanup_runtime():
+    try:
+        info = os.lstat(RUNTIME_DIR)
+    except FileNotFoundError:
+        return
+    _verify_root_dir(RUNTIME_DIR)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError(f"refusing unsafe runtime directory: {RUNTIME_DIR}")
+    runtime_state = os.path.join(RUNTIME_DIR, "state.json")
+    try:
+        runtime_info = os.lstat(runtime_state)
+    except FileNotFoundError:
+        runtime_info = None
+    if runtime_info is not None:
+        if not stat.S_ISREG(runtime_info.st_mode) or runtime_info.st_uid != 0 or runtime_info.st_nlink != 1 or runtime_info.st_size > MAX_SOURCE_BYTES:
+            raise RuntimeError(f"refusing unsafe runtime state: {runtime_state}")
+        os.unlink(runtime_state)
+    try:
+        os.rmdir(RUNTIME_DIR)
     except OSError as exc:
         if exc.errno != errno.ENOTEMPTY:
             raise
@@ -294,12 +329,69 @@ def _cleanup_legacy_store():
         print(f"removed {path}")
 
 
+def _clear_uninstall_flag():
+    try:
+        info = os.lstat(UNINSTALL_PATH)
+    except FileNotFoundError:
+        return
+    _verify_root_dir(STATE_DIR)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > 64:
+        raise RuntimeError(f"refusing unsafe uninstall flag: {UNINSTALL_PATH}")
+    os.unlink(UNINSTALL_PATH)
+    directory_fd = os.open(STATE_DIR, _flags(os.O_RDONLY | os.O_DIRECTORY))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _create_uninstall_flag():
+    _ensure_root_dir(STATE_DIR, 0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(UNINSTALL_PATH, flags, 0o600)
+    except FileExistsError:
+        info = os.lstat(UNINSTALL_PATH)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > 64:
+            raise RuntimeError(f"refusing unsafe uninstall flag: {UNINSTALL_PATH}")
+        return
+    try:
+        os.write(fd, b"uninstall\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def uninstall():
     for command in (["systemctl", "disable", "--now", "cpu-cap-boost.service"], ["systemctl", "daemon-reload"]):
         subprocess.run(command, check=False)
+    active = subprocess.run(
+        ["systemctl", "show", "-p", "ActiveState", "--value", "cpu-cap-boost.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if active.returncode != 0 or active.stdout.strip() not in ("inactive", "failed"):
+        raise RuntimeError("cpu-cap-boost.service is still running or stopping")
+    helper_present = os.path.lexists(HELPER_PATH)
+    state_present = os.path.lexists(STATE_PATH) or os.path.lexists(POLICY_PATH)
+    if not helper_present and state_present:
+        raise RuntimeError("Boost helper is missing; refusing to remove CPU policy state")
+    if helper_present:
+        _verify_root_dir(os.path.dirname(HELPER_PATH))
+        _check_target(HELPER_PATH)
+    _create_uninstall_flag()
+    if helper_present:
+        if os.path.lexists(POLICY_PATH):
+            reset = subprocess.run([HELPER_PATH, "reset"], check=False)
+            if reset.returncode != 0:
+                raise RuntimeError("could not reset the root-owned Boost policy")
+        else:
+            subprocess.run([HELPER_PATH, "set", "max"], check=True)
     _remove_file(POLKIT_RULE)
     _remove_file(SYSTEMD_UNIT)
     _remove_file(HELPER_PATH)
+    _remove_file(DAEMON_PATH)
     try:
         if os.path.lexists(HELPER_DIR):
             _verify_root_dir(HELPER_DIR)
@@ -310,6 +402,7 @@ def uninstall():
         if exc.errno != errno.ENOTEMPTY:
             raise
     _cleanup_state()
+    _cleanup_runtime()
     _cleanup_legacy_store()
     subprocess.run(["systemctl", "daemon-reload"], check=False)
 
@@ -325,11 +418,11 @@ def main():
         return 1
     if args.uninstall:
         if args.dry_run:
-            print("would disable and remove the Boost polkit rule, systemd unit, helper, and state")
+            print("would disable and remove the Boost polkit rule, systemd monitor, helper, and state")
             return 0
         try:
             uninstall()
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
             print(f"setup.py: {exc}", file=sys.stderr)
             return 1
         print("Boost root integration removed")
@@ -359,16 +452,24 @@ def main():
         print(rule, end="")
         print(f"===== would write {SYSTEMD_UNIT} =====")
         print(unit, end="")
-        print(f"===== would install {HELPER_PATH} and create {STATE_DIR} =====")
+        print(f"===== would install {HELPER_PATH} and {DAEMON_PATH} and create {STATE_DIR} =====")
         return 0
     try:
         _ensure_root_dir(HELPER_DIR)
         _ensure_root_dir(STATE_DIR, 0o700)
+        _clear_uninstall_flag()
         install_helper(helper_source)
         write(POLKIT_RULE, rule)
         write(SYSTEMD_UNIT, unit)
         subprocess.run(["systemctl", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "enable", "cpu-cap-boost.service"], check=True)
+        subprocess.run(["systemctl", "restart", "cpu-cap-boost.service"], check=True)
+        for _ in range(20):
+            if subprocess.run(["systemctl", "is-active", "--quiet", "cpu-cap-boost.service"], check=False).returncode == 0:
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError("cpu-cap-boost.service did not become active")
     except (OSError, RuntimeError, UnicodeError, subprocess.CalledProcessError) as exc:
         print(f"setup.py: {exc}", file=sys.stderr)
         return 1

@@ -410,6 +410,196 @@ class BoostSecurityTests(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
+    def test_thermal_guard_latches_and_releases_after_cooldown(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "state", "maxboost")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            applied = []
+            try:
+                with mock.patch.object(boostset, "_apply_cap", side_effect=lambda value, skip_unchanged=False: (applied.append(value) or value, {})), \
+                     mock.patch.object(boostset, "package_temp", return_value=50.0), \
+                     mock.patch.object(boostset.time, "time", return_value=1000.0):
+                    boostset.initialize_baseline("4.0", state_path)
+                    boostset.configure_guard("1", "90", "80", "3.0", "60", state_path)
+                    applied.clear()
+                    policy, effective, _ = boostset._run_change(state_path, lambda value: None, 95.0, 1000.0)
+                    self.assertTrue(policy["guard"]["latched"])
+                    self.assertEqual(effective, "3.0")
+                    policy, effective, _ = boostset._run_change(state_path, lambda value: None, 70.0, 1030.0)
+                    self.assertTrue(policy["guard"]["latched"])
+                    self.assertEqual(effective, "3.0")
+                    policy, effective, _ = boostset._run_change(state_path, lambda value: None, 70.0, 1090.0)
+                    self.assertFalse(policy["guard"]["latched"])
+                    self.assertEqual(effective, "4.0")
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+            self.assertEqual(applied[-3:], ["3.0", "3.0", "4.0"])
+
+    def test_countdown_uses_latest_manual_baseline_and_guard_wins(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "state", "maxboost")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            applied = []
+            try:
+                with mock.patch.object(boostset, "_apply_cap", side_effect=lambda value, skip_unchanged=False: (applied.append(value) or value, {})), \
+                     mock.patch.object(boostset, "package_temp", return_value=50.0), \
+                     mock.patch.object(boostset.time, "time", return_value=1000.0):
+                    boostset.initialize_baseline("4.0", state_path)
+                    applied.clear()
+                    effective = boostset.start_boost(60, state_path)
+                    self.assertEqual(effective, "max")
+                    policy, effective, _ = boostset._run_change(state_path, lambda value: None, 50.0, 1061.0)
+                    self.assertEqual(effective, "4.0")
+                    self.assertEqual(policy["boostUntil"], 0.0)
+                    boostset.start_boost(60, state_path)
+                    boostset.set_cap("3.5", state_path)
+                    policy = boostset._read_policy_unlocked(state_path)
+                    self.assertEqual(policy["boostUntil"], 0.0)
+                    with mock.patch.object(boostset, "package_temp", return_value=95.0):
+                        with self.assertRaises(boostset.ControlError):
+                            boostset.configure_guard("1", "90", "80", "3.0", "60", state_path)
+                            boostset.start_boost(60, state_path)
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+
+    def test_telemetry_utilization_and_power_wrap(self):
+        self.assertIsNone(boostctl.utilization(None, (100, 50)))
+        self.assertAlmostEqual(boostctl.utilization((100, 50), (200, 100)), 50.0)
+        previous = {"package-0": (900000, 1000000)}
+        current = {"package-0": (100000, 1000000)}
+        power, result = boostset._rapl_power(previous, current, 1.0)
+        self.assertEqual(result, current)
+        self.assertAlmostEqual(power, 0.2)
+
+    def test_persist_validates_guard_and_countdown_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = os.path.join(directory, "shell.json")
+            with open(config, "w", encoding="utf-8") as handle:
+                json.dump({"bar": {"layout": {"right": [{"id": persist.PLUGIN_ID, "maxGHz": "3.0"}]}}}, handle)
+            persist.persist_changes({
+                "thermalGuard": True,
+                "thermalHighC": 90,
+                "thermalLowC": 80,
+                "thermalCapGHz": "3.0",
+                "thermalCooldown": 60,
+                "boostMinutes": 10,
+                "telemetryEnabled": True,
+            }, config)
+            with open(config, encoding="utf-8") as handle:
+                entry = json.load(handle)["bar"]["layout"]["right"][0]
+            self.assertEqual(entry["thermalHighC"], 90)
+            self.assertEqual(entry["boostMinutes"], 10)
+            with self.assertRaises(persist.PersistenceError):
+                persist.persist_changes({"thermalLowC": 95}, config)
+            with self.assertRaises(persist.PersistenceError):
+                persist.persist_changes({"boostMinutes": 0}, config)
+
+    def test_cpu_dirs_accept_sysfs_cpufreq_symlinks(self):
+        old_root = boostset.CPU_ROOT
+        with tempfile.TemporaryDirectory() as directory:
+            real = os.path.join(directory, "real-cpufreq")
+            os.mkdir(real)
+            cpu = os.path.join(directory, "cpu0")
+            os.mkdir(cpu)
+            with open(os.path.join(cpu, "online"), "w", encoding="ascii") as handle:
+                handle.write("1\n")
+            os.symlink(real, os.path.join(cpu, "cpufreq"))
+            boostset.CPU_ROOT = directory
+            try:
+                self.assertEqual(boostset.cpu_dirs(), [os.path.join(cpu, "cpufreq")])
+            finally:
+                boostset.CPU_ROOT = old_root
+
+    def test_boot_id_is_normalized(self):
+        self.assertRegex(boostset._boot_id(), r"^[0-9a-f]{32}$")
+
+    def test_uninitialized_policy_does_not_touch_sysfs(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "state", "maxboost")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            try:
+                with mock.patch.object(boostset, "_apply_cap") as apply:
+                    policy, effective, _ = boostset._run_change(state_path, lambda value: None, 50.0, 1000.0, force=False)
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+            self.assertFalse(policy["initialized"])
+            self.assertEqual(effective, "max")
+            self.assertFalse(os.path.exists(state_path))
+            apply.assert_not_called()
+
+    def test_thermal_guard_never_raises_manual_cap(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "state", "maxboost")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            try:
+                with mock.patch.object(boostset, "_apply_cap", side_effect=lambda value, skip_unchanged=False: (value, {})), \
+                     mock.patch.object(boostset, "package_temp", return_value=95.0), \
+                     mock.patch.object(boostset.time, "time", return_value=1000.0):
+                    boostset.initialize_baseline("2.0", state_path)
+                    boostset.configure_guard("1", "90", "80", "3.0", "60", state_path)
+                    policy, effective, _ = boostset._run_change(state_path, lambda value: None, 95.0, 1000.0)
+                    self.assertTrue(policy["guard"]["latched"])
+                    self.assertEqual(effective, "2.0")
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+
+    def test_reset_policy_clears_latched_guard(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "state", "maxboost")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            try:
+                with mock.patch.object(boostset, "_apply_cap", side_effect=lambda value, skip_unchanged=False: (value, {})), \
+                     mock.patch.object(boostset, "package_temp", return_value=95.0), \
+                     mock.patch.object(boostset.time, "time", return_value=1000.0):
+                    boostset.initialize_baseline("4.0", state_path)
+                    boostset.configure_guard("1", "90", "80", "3.0", "60", state_path)
+                    effective = boostset.reset_policy(state_path)
+                    self.assertEqual(effective, "max")
+                    policy = boostset._read_policy_unlocked(state_path)
+                    self.assertFalse(policy["guard"]["enabled"])
+                    self.assertFalse(policy["guard"]["latched"])
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+
+    def test_reset_policy_replaces_malformed_state(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = os.path.join(directory, "state")
+            os.mkdir(state_dir)
+            state_path = os.path.join(state_dir, "maxboost")
+            with open(state_path, "wb") as handle:
+                handle.write(b"not-a-cap\n")
+            with open(state_path + ".policy", "wb") as handle:
+                handle.write(b"not-json\n")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            try:
+                with mock.patch.object(boostset, "_apply_cap", side_effect=lambda value, skip_unchanged=False: (value, {})):
+                    self.assertEqual(boostset.reset_policy(state_path), "max")
+                self.assertEqual(boostset._read_persisted(state_path), "max")
+                self.assertEqual(boostset._read_policy_unlocked(state_path)["guard"]["latched"], False)
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+
+    def test_countdown_target_respects_manual_ceiling(self):
+        old_uid = boostset.STATE_OWNER_UID
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "state", "maxboost")
+            boostset.STATE_OWNER_UID = os.geteuid()
+            try:
+                with mock.patch.object(boostset, "_apply_cap", side_effect=lambda value, skip_unchanged=False: (value, {})), \
+                     mock.patch.object(boostset, "package_temp", return_value=50.0), \
+                     mock.patch.object(boostset.time, "time", return_value=1000.0):
+                    boostset.initialize_baseline("3.0", state_path)
+                    effective = boostset.start_boost(60, state_path, cap="4.0")
+                    self.assertEqual(effective, "4.0")
+            finally:
+                boostset.STATE_OWNER_UID = old_uid
+
     def test_installer_pins_one_helper_source_snapshot(self):
         source = Path(__file__).parents[1] / "boostset.py"
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -433,11 +623,14 @@ class BoostSecurityTests(unittest.TestCase):
             "PrivateDevices=yes",
             "PrivateNetwork=yes",
             "ProtectSystem=strict",
-            "ReadWritePaths=-/sys/devices/system/cpu -/var/lib/omarchy-boost",
+            "RuntimeDirectory=omarchy-boost",
+            "StateDirectory=omarchy-boost",
+            "ReadWritePaths=-/sys/devices/system/cpu -/var/lib/omarchy-boost -/run/omarchy-boost",
             "CapabilityBoundingSet=",
             "SystemCallFilter=@system-service",
         ):
             self.assertIn(directive, unit)
+        self.assertIn("ExecStart=/usr/bin/python3 -I " + setup.DAEMON_PATH + " run", unit)
 
     def test_polkit_rule_uses_json_escaping(self):
         rule = setup.polkit_rule('user"x', '/tmp/helper')

@@ -3,10 +3,10 @@
   "schemaVersion": 1,
   "id": "davidjm.boost",
   "name": "Boost",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "David JM",
   "license": "MIT",
-  "description": "Limit your CPU's max boost clock straight from the bar. Left-click opens a slider with quick presets found in the popup; every change applies live to all cores and is re-applied on the next boot.",
+  "description": "Limit your CPU's max boost clock straight from the bar, with optional thermal protection, temporary MAX boosts, and live CPU telemetry.",
   "repository": "https://github.com/davidmessenger123/omarchy-boost",
   "kinds": [
     "bar-widget"
@@ -16,14 +16,22 @@
   },
   "barWidget": {
     "displayName": "Boost",
-    "description": "A bolt glyph showing the current max boost cap. Left-click opens a continuous slider (1.0 GHz up to the CPU's own max boost, labelled MAX), editable preset chips (BASE, any GHz values, MAX), and live package temperature. Changes apply immediately to online cores through a separately installed root-owned helper and persist across reboots. Right-click cycles the presets on the fly and pops a notification with the new cap; middle-click re-syncs the readout with sysfs.",
+    "description": "A bolt glyph showing the current max boost cap. Left-click opens a slider, presets, Thermal Guard, temporary MAX boost countdowns, and live frequency/power/utilization graphs. Changes apply through the separately installed root-owned helper and persist across reboots; right-click cycles presets and middle-click refreshes the live reading.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "maxGHz": "3.0",
       "presets": "",
-      "capMax": ""
+      "capMax": "",
+      "baseGHz": "",
+      "thermalGuard": false,
+      "thermalHighC": 90,
+      "thermalLowC": 80,
+      "thermalCapGHz": "3.0",
+      "thermalCooldown": 60,
+      "boostMinutes": 10,
+      "telemetryEnabled": true
     },
     "schema": [
       {
@@ -48,13 +56,62 @@
         "defaultValue": "",
         "description": "Pin the usable max-boost ceiling to a fixed value, e.g. 4.7 for a CPU that a PBO BIOS reports higher than its rated max. Blank = trust the CPU's own reported max. Never exceeds the CPU's sysfs max."
       },
-      {
-        "key": "baseGHz",
-        "type": "string",
-        "label": "Base clock (GHz)",
-        "defaultValue": "",
-        "description": "Manual base clock for the panel and the BASE preset, e.g. 3.8, when sysfs can't report it (acpi-cpufreq Ryzen without CPPC exposes no base_frequency). Blank = auto-detect."
-      }
+        {
+          "key": "baseGHz",
+          "type": "string",
+          "label": "Base clock (GHz)",
+          "defaultValue": "",
+          "description": "Manual base clock for the panel and the BASE preset, e.g. 3.8, when sysfs can't report it (acpi-cpufreq Ryzen without CPPC exposes no base_frequency). Blank = auto-detect."
+        },
+        {
+          "key": "thermalGuard",
+          "type": "bool",
+          "label": "Thermal Guard",
+          "defaultValue": false,
+          "description": "Automatically lower the CPU cap when the package temperature reaches the trigger threshold. The guard releases only after the package stays below the release threshold for the cooldown period."
+        },
+        {
+          "key": "thermalHighC",
+          "type": "int",
+          "label": "Thermal Guard trigger (°C)",
+          "defaultValue": 90,
+          "description": "Package temperature at which Thermal Guard engages."
+        },
+        {
+          "key": "thermalLowC",
+          "type": "int",
+          "label": "Thermal Guard release (°C)",
+          "defaultValue": 80,
+          "description": "Package temperature below which Thermal Guard can begin its cooldown release. Must be lower than the trigger."
+        },
+        {
+          "key": "thermalCapGHz",
+          "type": "string",
+          "label": "Thermal Guard cap (GHz)",
+          "defaultValue": "3.0",
+          "description": "Maximum CPU cap used while Thermal Guard is latched. It is still clamped to the CPU's reported hardware ceiling."
+        },
+        {
+          "key": "thermalCooldown",
+          "type": "int",
+          "label": "Thermal Guard cooldown (seconds)",
+          "defaultValue": 60,
+          "description": "Time the package must remain below the release threshold before the normal cap is restored."
+        },
+        {
+          "key": "boostMinutes",
+          "type": "int",
+          "label": "Temporary boost duration (minutes)",
+          "defaultValue": 10,
+          "description": "Default duration for the temporary MAX boost button. The active countdown continues in the background and restores the latest manual cap when it expires."
+        },
+        {
+          "key": "telemetryEnabled",
+          "type": "bool",
+          "label": "Live CPU graphs",
+          "defaultValue": true,
+          "description": "Collect and display live frequency, package power, and CPU utilization graphs when the Boost monitor is available."
+        }
     ]
   }
 }

@@ -10,10 +10,11 @@ import qs.Ui
 // overclock as its max), only lower or lift a previously-lowered cap up to
 // that reported ceiling.
 //
-// The widget reads the live cap through the unprivileged boostctl.py monitor
-// and applies changes through the separately installed root-owned boostset.py
-// helper. The helper persists only a validated cap in a root-owned state file;
-// the widget's shell.json entry is updated only after the helper succeeds.
+// The widget reads live telemetry from the root-owned monitor when available
+// and falls back to the unprivileged boostctl.py monitor. It applies changes
+// through the separately installed root-owned boostset.py helper. The helper
+// persists the manual baseline, guard latch, and countdown policy; the widget's
+// shell.json entry is updated only after the helper succeeds.
 //
 // Left click: open the slider panel. Right click: cycle presets on the fly.
 // Middle click: re-read the current cap from sysfs.
@@ -29,6 +30,11 @@ BarWidget {
     var path = String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")
     return path.charAt(path.length - 1) === "/" ? path : path + "/"
   }
+  readonly property string helperPath: "/usr/local/libexec/omarchy-boost/boostset.py"
+  readonly property string policyStatePath: "/run/omarchy-boost/state.json"
+  readonly property string runtimeDir: String(Quickshell.env("XDG_RUNTIME_DIR") || "")
+  readonly property string statePath: root.runtimeDir.charAt(0) === "/"
+    ? root.runtimeDir + "/davidjm-boost-state.json" : "/tmp/davidjm-boost-state.json"
 
   // The intended cap from settings (persisted); the bar readout instead shows
   // the sysfs truth (`state.max`) so out-of-band changes are always visible.
@@ -48,6 +54,24 @@ BarWidget {
   // Optional manual base clock, e.g. "3.8", for CPUs where sysfs can't report
   // it (acpi-cpufreq Ryzen without CPPC). Blank = auto-detect.
   property string baseGHz: String(root.effective("baseGHz", ""))
+
+  property bool thermalGuard: root.boolSetting("thermalGuard", false)
+  property int thermalHighC: root.intSetting("thermalHighC", 90)
+  property int thermalLowC: root.intSetting("thermalLowC", 80)
+  property string thermalCapGHz: String(root.effective("thermalCapGHz", "3.0"))
+  property int thermalCooldown: root.intSetting("thermalCooldown", 60)
+  property int boostMinutes: root.intSetting("boostMinutes", 10)
+  property bool telemetryEnabled: root.boolSetting("telemetryEnabled", true)
+
+  property var telemetry: ({ "freq": [], "power": [], "util": [] })
+  property string telemetrySource: ""
+  property int telemetrySequence: -1
+  property string telemetryBoot: ""
+  property bool policySyncRequested: false
+  property bool baselineSyncRequested: false
+  property var pendingPolicyRequest: null
+  property real policyRetryAt: 0
+  property string policyNotice: ""
 
   // Set by right-click cycling: once the pending apply lands, fire a desktop
   // notification saying what the new max boost is.
@@ -89,9 +113,117 @@ BarWidget {
     return (e === undefined || e === null) ? fallback : e
   }
 
+  function boolSetting(name, fallback) {
+    var value = root.effective(name, fallback)
+    return value === true || value === 1 || value === "1" || value === "true"
+  }
+
+  function intSetting(name, fallback) {
+    var value = Number(root.effective(name, fallback))
+    return isFinite(value) ? Math.round(value) : fallback
+  }
+
   function fmt(value) {
     var n = Number(value)
     return isFinite(n) ? n.toFixed(1) : "–"
+  }
+
+  function capText(value) {
+    var text = String(value === undefined || value === null ? "" : value).trim().toLowerCase()
+    if (text === "max") return "max"
+    var number = Number(text)
+    return isFinite(number) ? (Math.round(number * 10) / 10).toFixed(1) : ""
+  }
+
+  function boostSeconds() {
+    var until = Number(root.state && root.state.boostUntil)
+    if (!isFinite(until) || until <= 0) return 0
+    return Math.max(0, Math.ceil(until - Date.now() / 1000))
+  }
+
+  function duration(seconds) {
+    var value = Math.max(0, Math.floor(Number(seconds) || 0))
+    var hours = Math.floor(value / 3600)
+    var minutes = Math.floor((value % 3600) / 60)
+    var remainder = value % 60
+    if (hours > 0) return hours + "h " + minutes + "m"
+    if (minutes > 0) return minutes + "m " + remainder + "s"
+    return remainder + "s"
+  }
+
+  function guardConfigured(json) {
+    if (!json || json.initialized === undefined) return true
+    var cap = root.capText(json.guardCap)
+    return json.guardEnabled === root.thermalGuard
+      && Number(json.guardHighC) === root.thermalHighC
+      && Number(json.guardLowC) === root.thermalLowC
+      && cap === root.capText(root.thermalCapGHz)
+      && Number(json.guardCooldown) === root.thermalCooldown
+  }
+
+  function appendHistory(values, value) {
+    var next = (values || []).slice()
+    next.push(value === null || value === undefined || !isFinite(Number(value)) ? null : Number(value))
+    if (next.length > 60) next = next.slice(next.length - 60)
+    return next
+  }
+
+  function appendTelemetry(json) {
+    if (!root.telemetryEnabled) {
+      if (root.telemetry.freq.length || root.telemetry.power.length || root.telemetry.util.length)
+        root.telemetry = { "freq": [], "power": [], "util": [] }
+      return
+    }
+    var sequence = Number(json.seq)
+    if (!isFinite(sequence)) return
+    var boot = String(json.bootId || "") + ":" + String(json.instance || "")
+    if (boot !== root.telemetryBoot) {
+      root.telemetryBoot = boot
+      root.telemetrySequence = -1
+      root.telemetry = { "freq": [], "power": [], "util": [] }
+    }
+    if (sequence <= root.telemetrySequence) return
+    root.telemetry = {
+      "freq": root.appendHistory(root.telemetry.freq, json.freq),
+      "power": root.appendHistory(root.telemetry.power, json.power),
+      "util": root.appendHistory(root.telemetry.util, json.util)
+    }
+    root.telemetrySequence = sequence
+  }
+
+  function paintGraph(canvas, values, minimum, maximum, color) {
+    var context = canvas.getContext("2d")
+    var width = Math.max(1, canvas.width)
+    var height = Math.max(1, canvas.height)
+    context.clearRect(0, 0, width, height)
+    context.strokeStyle = Qt.rgba(1, 1, 1, 0.12)
+    context.lineWidth = 1
+    context.beginPath()
+    context.moveTo(0, height - 1)
+    context.lineTo(width, height - 1)
+    context.stroke()
+    var points = values || []
+    if (points.length < 2) return
+    var low = Number(minimum)
+    var high = Number(maximum)
+    if (!isFinite(low) || !isFinite(high) || high <= low) return
+    context.strokeStyle = color
+    context.lineWidth = 2
+    context.beginPath()
+    var drawing = false
+    for (var i = 0; i < points.length; i++) {
+      var value = points[i] === null ? null : Number(points[i])
+      if (value === null || !isFinite(value)) {
+        drawing = false
+        continue
+      }
+      var x = points.length === 1 ? width : i * width / (points.length - 1)
+      var y = height - Math.max(0, Math.min(1, (value - low) / (high - low))) * (height - 4) - 2
+      if (drawing) context.lineTo(x, y)
+      else context.moveTo(x, y)
+      drawing = true
+    }
+    context.stroke()
   }
 
   // Highest allowed cap: the CPU's reported full-turbo once the state has
@@ -99,7 +231,7 @@ BarWidget {
   // A manual `capMax` pins the ceiling below what the board reports when you
   // want MAX to mean your own number (e.g. a CPU rated 4.7 GHz that a PBO
   // BIOS reports as 5.0). Either way the widget can't ask for more than the
-  // CPU reports, and boostctl.py enforces the same limit at sysfs.
+  // CPU reports, and boostset.py enforces the same limit at sysfs.
   function cpuMax() {
     var ceiling = 100.0
     var over = Number(root.capMax)
@@ -232,14 +364,12 @@ BarWidget {
     return entry
   }
 
-  // Push the unioned entry into both runtime settings and disk. Writing the
-  // whole entry every time (rather than one changed key) makes each save
-  // self-contained, so nothing can ever be dropped because a previous write
-  // wasn't picked up yet.
+  // Push the unioned entry into runtime settings and persist only the fields
+  // changed by this action, so concurrent writers cannot overwrite newer keys.
   function applySettingsEntry(changes, notice) {
     var entry = root.mergedEntry(changes)
     root.settings = entry
-    root.pendingSettingsEntry = JSON.stringify(entry)
+    root.pendingSettingsEntry = JSON.stringify(changes)
     if (!root.persistInFlight) root.startPersistence()
     if (notice) root.keyNotice = notice
   }
@@ -269,6 +399,99 @@ BarWidget {
       : "Base clock cleared (auto-detect)")
   }
 
+  function policyCommand(args, success, failure) {
+    if (!Array.isArray(args) || args.length === 0 || args.length > 6) return false
+    if (policyProc.running || applyProcess.running || root.persistInFlight || root.pendingSettingsEntry || root.pendingPolicyRequest) return false
+    policyProc.output = ""
+    policyProc.command = ["pkexec", root.helperPath].concat(args)
+    policyProc.successText = String(success || "")
+    policyProc.failureText = String(failure || "CPU policy action failed")
+    policyProc.running = true
+    return true
+  }
+
+  function policyBusy() {
+    return policyProc.running || applyProcess.running || root.persistInFlight || root.pendingSettingsEntry !== "" || root.pendingPolicyRequest !== null
+  }
+
+  function queuePolicyRequest(args, success, failure) {
+    root.pendingPolicyRequest = {
+      "args": args.slice(0),
+      "success": String(success || ""),
+      "failure": String(failure || "CPU policy action failed")
+    }
+    root.launchPendingPolicy()
+  }
+
+  function launchPendingPolicy() {
+    if (!root.pendingPolicyRequest || root.persistInFlight || root.pendingSettingsEntry || policyProc.running || applyProcess.running) return
+    var request = root.pendingPolicyRequest
+    root.pendingPolicyRequest = null
+    root.policyCommand(request.args, request.success, request.failure)
+  }
+
+  function syncPolicy(json) {
+    if (!json || json.guardEnabled === undefined || policyProc.running || applyProcess.running || root.persistInFlight || root.pendingPolicyRequest || Date.now() < root.policyRetryAt) return
+    if (json.initialized === false && !root.baselineSyncRequested) {
+      root.baselineSyncRequested = true
+      root.policyCommand(["initialize", String(root.maxGHz)], "CPU baseline initialized", "Could not initialize the CPU baseline")
+      return
+    }
+    if (root.baselineSyncRequested || root.guardConfigured(json)) return
+    root.policySyncRequested = true
+    root.policyCommand([
+      "guard", root.thermalGuard ? "1" : "0", String(root.thermalHighC), String(root.thermalLowC),
+      root.capText(root.thermalCapGHz), String(root.thermalCooldown)
+    ], "Thermal Guard updated", "Could not update Thermal Guard")
+  }
+
+  function saveThermalSettings(guardOverride) {
+    var enabled = guardOverride === undefined ? root.thermalGuard : guardOverride
+    var high = Math.round(Number(thermalHighField.text))
+    var low = Math.round(Number(thermalLowField.text))
+    var cap = root.capText(thermalCapField.text)
+    var cooldown = Math.round(Number(thermalCooldownField.text))
+    var capNumber = Number(cap)
+    if (!isFinite(high) || !isFinite(low) || !isFinite(cooldown) || high < -20 || high > 150 || low < -20 || low >= high || cooldown < 0 || cooldown > 86400 || !cap || cap === "max" || !isFinite(capNumber) || capNumber < 0.1 || capNumber > 100) {
+      root.keyNotice = "Thermal Guard needs a release temperature below the trigger."
+      return
+    }
+    root.applySettingsEntry({
+      "thermalGuard": enabled,
+      "thermalHighC": high,
+      "thermalLowC": low,
+      "thermalCapGHz": cap,
+      "thermalCooldown": cooldown
+    }, root.thermalGuard ? "Thermal Guard enabled" : "Thermal Guard disabled")
+    root.queuePolicyRequest([
+      "guard", enabled ? "1" : "0", String(high), String(low), cap, String(cooldown)
+    ], "Thermal Guard updated", "Could not update Thermal Guard")
+  }
+
+  function toggleThermalGuard() {
+    root.saveThermalSettings(!root.thermalGuard)
+  }
+
+  function saveBoostMinutes() {
+    var minutes = Math.round(Number(boostMinutesField.text))
+    if (!isFinite(minutes) || minutes < 1 || minutes > 1440) {
+      root.keyNotice = "Boost duration must be between 1 and 1440 minutes."
+      return
+    }
+    root.applySettingsEntry({ "boostMinutes": minutes }, "Boost duration set to " + minutes + " minutes")
+  }
+
+  function startTemporaryBoost() {
+    if (root.boostSeconds() > 0) return
+    if (!root.policyCommand(["boost", String(root.boostMinutes * 60), root.cpuMax().toFixed(1)], "Temporary MAX boost started", "Could not start temporary boost"))
+      root.keyNotice = "Wait for the current CPU policy action to finish."
+  }
+
+  function cancelTemporaryBoost() {
+    if (!root.policyCommand(["cancel-boost"], "Temporary boost cancelled", "Could not cancel temporary boost"))
+      root.keyNotice = "Wait for the current CPU policy action to finish."
+  }
+
   function toggleSettings() {
     root.settingsOpen = !root.settingsOpen
     if (root.settingsOpen) root.keyNotice = ""
@@ -282,6 +505,11 @@ BarWidget {
   // The shell live-patches settings after persist.py; a released slider then
   // stops previewing and the bound (now-current) value takes over.
   onSettingsChanged: root.dragGHz = -1
+  onTelemetryChanged: {
+    frequencyGraph.requestPaint()
+    powerGraph.requestPaint()
+    utilizationGraph.requestPaint()
+  }
 
   readonly property string displayMax:
     (root.state && root.state.max !== undefined && root.state.max !== null)
@@ -290,21 +518,40 @@ BarWidget {
   // --------------------------------------------------------------- state sync
 
   function refreshState() {
+    policyStateFile.reload()
     stateFile.reload()
   }
 
-  function parseState(text) {
+  function rootStateFresh() {
+    if (root.telemetrySource !== "root" || !root.state || root.state.time === undefined) return false
+    var age = Date.now() / 1000 - Number(root.state.time)
+    return isFinite(age) && age >= -5 && age <= 5
+  }
+
+  function parseState(text, authoritative) {
     var source = String(text || "")
     if (!source || source.length > 1048576) return
     var json = {}
     try { json = JSON.parse(source) } catch (e) { return }
     if (!json || typeof json !== "object" || Array.isArray(json)) return
-    var numeric = ["max", "turbo", "base", "temp"]
+    var numeric = ["max", "turbo", "base", "temp", "freq", "power", "util", "boostUntil"]
     for (var i = 0; i < numeric.length; i++) {
       var value = json[numeric[i]]
       if (value !== null && value !== undefined && (typeof value !== "number" || !isFinite(value))) return
     }
-    if (json.max !== undefined) root.state = json
+    if (json.error !== undefined && typeof json.error !== "string") return
+    if (json.max === undefined) return
+    if (authoritative) {
+      if (json.version !== 1 || typeof json.seq !== "number" || !isFinite(json.seq)) return
+      root.telemetrySource = "root"
+      root.state = json
+      root.appendTelemetry(json)
+      root.syncPolicy(json)
+    } else if (!root.rootStateFresh()) {
+      root.telemetrySource = "fallback"
+      root.state = json
+      root.appendTelemetry(json)
+    }
   }
 
   // ------------------------------------------------------------------- apply
@@ -312,6 +559,10 @@ BarWidget {
   function applyValue(ghz) {
     var n = Number(ghz)
     if (!isFinite(n) || n <= 0) return false
+    if (policyProc.running || root.persistInFlight || root.pendingSettingsEntry || root.pendingPolicyRequest) {
+      root.keyNotice = "Wait for the current CPU policy action to finish."
+      return false
+    }
     n = Math.min(n, root.cpuMax(), 100.0)
     n = Math.max(1.0, Math.round(n * 10) / 10)
     if (!isFinite(n) || n <= 0) return false
@@ -330,7 +581,7 @@ BarWidget {
 
   function startApply(n) {
     root.pendingApplyGHz = n.toFixed(1)
-    applyProcess.command = ["pkexec", "/usr/local/libexec/omarchy-boost/boostset.py", "set", root.pendingApplyGHz]
+    applyProcess.command = ["pkexec", root.helperPath, "set", root.pendingApplyGHz]
     applyProcess.running = true
     var fresh = root.state || {}
     fresh.max = n
@@ -375,11 +626,43 @@ BarWidget {
       } else {
         root.keyNotice = "Apply failed — the root helper rejected the cap."
       }
-      if (root.pendingGHz >= 0) {
-        var next = root.pendingGHz
+      if (exitCode !== 0) {
         root.pendingGHz = -1
-        root.startApply(next)
+        root.launchPendingPolicy()
+      } else if (root.pendingGHz < 0) {
+        root.launchPendingPolicy()
       }
+    }
+  }
+
+  Process {
+    id: policyProc
+    property string output: ""
+    property string successText: ""
+    property string failureText: ""
+    stdout: SplitParser {
+      onRead: function(data) {
+        if (policyProc.output.length < 512) policyProc.output += String(data || "")
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(data) {
+        if (policyProc.output.length < 512) policyProc.output += String(data || "")
+      }
+    }
+    onExited: function(exitCode) {
+      root.policySyncRequested = false
+      root.baselineSyncRequested = false
+      if (exitCode === 0) {
+        root.policyRetryAt = 0
+        root.keyNotice = policyProc.successText
+      } else {
+        root.policyRetryAt = Date.now() + 10000
+        root.keyNotice = policyProc.failureText
+          + (policyProc.output.trim() ? ": " + policyProc.output.trim().slice(0, 160) : "")
+      }
+      policyProc.output = ""
+      root.launchPendingPolicy()
     }
   }
 
@@ -387,12 +670,28 @@ BarWidget {
     id: persistProcess
     onExited: function(exitCode) {
       root.persistInFlight = false
-      if (exitCode !== 0) root.keyNotice = "Settings were not persisted."
+      if (exitCode !== 0) {
+        root.pendingPolicyRequest = null
+        root.pendingSettingsEntry = ""
+        var diskEntry = root.selfEntry()
+        root.settings = diskEntry instanceof Object ? JSON.parse(JSON.stringify(diskEntry)) : ({})
+        root.policyRetryAt = Date.now() + 10000
+        root.keyNotice = "Settings were not persisted."
+      }
       if (root.pendingSettingsEntry) root.startPersistence()
+      else if (exitCode === 0) {
+        if (root.pendingGHz >= 0) {
+          var next = root.pendingGHz
+          root.pendingGHz = -1
+          root.startApply(next)
+        } else {
+          root.launchPendingPolicy()
+        }
+      } else {
+        root.pendingGHz = -1
+      }
     }
   }
-
-  readonly property string statePath: "/tmp/davidjm-boost-state.json"
 
   Process {
     id: monitorProc
@@ -403,11 +702,28 @@ BarWidget {
   Timer { id: monitorRestart; interval: 3000; onTriggered: monitorProc.running = true }
 
   FileView {
+    id: policyStateFile
+    path: root.policyStatePath
+    watchChanges: false
+    printErrors: false
+    onTextChanged: root.parseState(policyStateFile.text(), true)
+    onLoadFailed: root.telemetrySource = "fallback"
+  }
+
+  FileView {
     id: stateFile
     path: root.statePath
     watchChanges: true
     printErrors: false
-    onTextChanged: root.parseState(stateFile.text())
+    onTextChanged: root.parseState(stateFile.text(), false)
+  }
+
+  Timer {
+    id: statePoll
+    interval: 1000
+    repeat: true
+    running: true
+    onTriggered: root.refreshState()
   }
 
   Component.onCompleted: root.refreshState()
@@ -580,6 +896,98 @@ BarWidget {
           Layout.alignment: Qt.AlignLeft
         }
 
+        ColumnLayout {
+          visible: root.telemetryEnabled
+          Layout.fillWidth: true
+          Layout.topMargin: Style.space(6)
+          spacing: Style.space(2)
+
+          Text {
+            text: "LIVE CPU"
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+            Layout.alignment: Qt.AlignLeft
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            Text {
+              text: "Frequency"
+              color: Qt.darker(Color.foreground, 1.15)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              Layout.fillWidth: true
+            }
+            Text {
+              text: root.state && root.state.freq !== undefined && root.state.freq !== null
+                ? root.fmt(root.state.freq) + " GHz" : "N/A"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+          Canvas {
+            id: frequencyGraph
+            Layout.fillWidth: true
+            height: Style.space(38)
+            onPaint: root.paintGraph(frequencyGraph, root.telemetry.freq, 0, Math.max(root.cpuMax(), Number(root.state.freq) || 0, 1), Color.accent)
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            Text {
+              text: "Package power"
+              color: Qt.darker(Color.foreground, 1.15)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              Layout.fillWidth: true
+            }
+            Text {
+              text: root.state && root.state.power !== undefined && root.state.power !== null
+                ? root.fmt(root.state.power) + " W" : "N/A"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+          Canvas {
+            id: powerGraph
+            Layout.fillWidth: true
+            height: Style.space(38)
+            onPaint: root.paintGraph(powerGraph, root.telemetry.power, 0, Math.max(10, (Number(root.state.power) || 0) * 1.25), Color.accent)
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            Text {
+              text: "Utilization"
+              color: Qt.darker(Color.foreground, 1.15)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              Layout.fillWidth: true
+            }
+            Text {
+              text: root.state && root.state.util !== undefined && root.state.util !== null
+                ? root.fmt(root.state.util) + "%" : "N/A"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+          Canvas {
+            id: utilizationGraph
+            Layout.fillWidth: true
+            height: Style.space(38)
+            onPaint: root.paintGraph(utilizationGraph, root.telemetry.util, 0, 100, Color.accent)
+          }
+        }
+
         RowLayout {
           spacing: Style.space(6)
           Layout.topMargin: Style.space(6)
@@ -611,6 +1019,142 @@ BarWidget {
             var norm = root.normalizeTokens(presetField.text.split(",")).join(",")
             root.savePresets(norm)
             presetField.text = norm
+          }
+        }
+
+        ColumnLayout {
+          Layout.fillWidth: true
+          Layout.topMargin: Style.space(6)
+          spacing: Style.space(4)
+
+          Text {
+            text: "TEMPORARY BOOST"
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+            Layout.alignment: Qt.AlignLeft
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+            Button {
+              text: root.boostSeconds() > 0 ? "Boosting MAX" : "Boost " + root.boostMinutes + "m"
+              enabled: root.boostSeconds() <= 0 && !root.policyBusy()
+              onClicked: root.startTemporaryBoost()
+            }
+            Button {
+              text: "Cancel"
+              visible: root.boostSeconds() > 0
+              enabled: !root.policyBusy()
+              onClicked: root.cancelTemporaryBoost()
+            }
+          }
+
+          Text {
+            text: root.boostSeconds() > 0
+              ? "Restores your latest manual cap in " + root.duration(root.boostSeconds())
+              : "Raises the cap to MAX, then restores the latest manual cap."
+            color: Qt.darker(Color.foreground, 1.15)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+            Layout.fillWidth: true
+          }
+
+          TextField {
+            id: boostMinutesField
+            text: String(root.boostMinutes)
+            placeholderText: "Minutes"
+            accent: Color.accent
+            foreground: Color.foreground
+            Layout.fillWidth: true
+            onAccepted: root.saveBoostMinutes()
+          }
+        }
+
+        ColumnLayout {
+          Layout.fillWidth: true
+          Layout.topMargin: Style.space(6)
+          spacing: Style.space(4)
+
+          Text {
+            text: "THERMAL GUARD"
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+            Layout.alignment: Qt.AlignLeft
+          }
+
+          Button {
+            text: root.thermalGuard ? "Disable Thermal Guard" : "Enable Thermal Guard"
+            enabled: !root.policyBusy()
+            Layout.alignment: Qt.AlignLeft
+            onClicked: root.toggleThermalGuard()
+          }
+
+          Text {
+            text: root.state && root.state.guardLatched
+              ? "Active — cap held at " + root.fmt(root.state.guardCap) + " GHz"
+              : root.thermalGuard ? "Ready — triggers at " + root.thermalHighC + "°C" : "Disabled"
+            color: root.state && root.state.guardLatched ? Color.urgent : Qt.darker(Color.foreground, 1.15)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+            Layout.fillWidth: true
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+            TextField {
+              id: thermalHighField
+              text: String(root.thermalHighC)
+              placeholderText: "Trigger °C"
+              accent: Color.accent
+              foreground: Color.foreground
+              Layout.fillWidth: true
+            }
+            TextField {
+              id: thermalLowField
+              text: String(root.thermalLowC)
+              placeholderText: "Release °C"
+              accent: Color.accent
+              foreground: Color.foreground
+              Layout.fillWidth: true
+            }
+          }
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+            TextField {
+              id: thermalCapField
+              text: root.thermalCapGHz
+              placeholderText: "Guard cap GHz"
+              accent: Color.accent
+              foreground: Color.foreground
+              Layout.fillWidth: true
+            }
+            TextField {
+              id: thermalCooldownField
+              text: String(root.thermalCooldown)
+              placeholderText: "Cooldown sec"
+              accent: Color.accent
+              foreground: Color.foreground
+              Layout.fillWidth: true
+            }
+          }
+
+          Button {
+            text: "Save Thermal Guard"
+            enabled: !root.policyBusy()
+            Layout.alignment: Qt.AlignLeft
+            onClicked: root.saveThermalSettings()
           }
         }
 
@@ -674,6 +1218,16 @@ BarWidget {
           text: root.keyNotice
           visible: root.keyNotice !== ""
           color: Color.popups.text
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+          Layout.fillWidth: true
+        }
+
+        Text {
+          text: root.state && root.state.error ? "Monitor: " + root.state.error : ""
+          visible: root.state && root.state.error !== undefined && root.state.error !== ""
+          color: Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.Wrap

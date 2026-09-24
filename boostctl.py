@@ -72,6 +72,7 @@ def _package_sensor(hwmon_root="/sys/class/hwmon"):
         entries = sorted(os.scandir(hwmon_root), key=lambda entry: entry.name)
     except OSError:
         return None
+    values = []
     for entry in entries:
         try:
             if not entry.is_dir(follow_symlinks=True):
@@ -95,14 +96,53 @@ def _package_sensor(hwmon_root="/sys/class/hwmon"):
             for stem in candidates:
                 value = _sensor_value(entry.path, stem)
                 if value is not None and math.isfinite(value):
-                    return round(value, 1)
+                    values.append(value)
         except OSError:
             continue
-    return None
+    return round(max(values), 1) if values else None
 
 
 def package_temp(hwmon_root="/sys/class/hwmon"):
     return _package_sensor(hwmon_root)
+
+
+def _cpu_times():
+    try:
+        with open("/proc/stat", encoding="ascii") as handle:
+            line = handle.readline()
+    except OSError:
+        return None
+    fields = line.split()
+    if not fields or fields[0] != "cpu" or len(fields) < 5:
+        return None
+    try:
+        values = [int(value) for value in fields[1:9]]
+    except ValueError:
+        return None
+    if any(value < 0 for value in values):
+        return None
+    return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
+
+
+def utilization(previous, current):
+    if previous is None or current is None:
+        return None
+    total_delta = current[0] - previous[0]
+    idle_delta = current[1] - previous[1]
+    if total_delta <= 0 or idle_delta < 0 or idle_delta > total_delta:
+        return None
+    return round(100.0 * (total_delta - idle_delta) / total_delta, 1)
+
+
+def current_frequency():
+    values = []
+    for directory in cpu_dirs(online_only=True):
+        value = _read_int(os.path.join(directory, "scaling_cur_freq"))
+        if value is None:
+            value = _read_int(os.path.join(directory, "cpuinfo_cur_freq"))
+        if value is not None:
+            values.append(value)
+    return round(sum(values) / len(values) / 1e6, 2) if values else None
 
 
 def base_freq():
@@ -145,7 +185,7 @@ def persisted():
     return None
 
 
-def get_state():
+def get_state(previous_cpu=None, include_internal=False):
     caps = []
     turbos = []
     for directory in cpu_dirs(online_only=True):
@@ -155,18 +195,28 @@ def get_state():
             caps.append(cap)
         if turbo is not None:
             turbos.append(turbo)
+    current_cpu = _cpu_times()
     base = base_freq()
     info = cpu_info()
-    return {
+    state = {
+        "version": 1,
+        "source": "fallback",
+        "time": int(time.time()),
         "max": round(max(caps) / 1e6, 1) if caps else None,
         "turbo": round(max(turbos) / 1e6, 1) if turbos else None,
         "base": round(base / 1e6, 1) if base else None,
         "temp": package_temp(),
+        "freq": current_frequency(),
+        "power": None,
+        "util": utilization(previous_cpu, current_cpu),
         "model": info["model"],
         "cores": info["cores"],
         "threads": info["threads"],
         "default": persisted(),
     }
+    if include_internal:
+        state["_cpuTimes"] = current_cpu
+    return state
 
 
 def write_state(state_file, state):
@@ -191,9 +241,18 @@ def write_state(state_file, state):
 
 
 def monitor(state_file, interval=2.0):
+    previous_cpu = None
+    sequence = 0
+    instance = str(os.getpid())
     while True:
         try:
-            write_state(state_file, get_state())
+            state = get_state(previous_cpu, include_internal=True)
+            previous_cpu = state.pop("_cpuTimes", None)
+            sequence += 1
+            state["seq"] = sequence
+            state["instance"] = instance
+            state["time"] = int(time.time())
+            write_state(state_file, state)
         except Exception:
             pass
         time.sleep(interval)

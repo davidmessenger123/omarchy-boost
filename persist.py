@@ -392,6 +392,24 @@ def _number(value, name, allow_empty=False):
     return f"{number:.1f}"
 
 
+def _bounded_integer(value, name, lower, upper):
+    if isinstance(value, bool):
+        raise PersistenceError(f"{name} must be a whole number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PersistenceError(f"{name} must be a whole number") from exc
+    if not math.isfinite(number) or number < lower or number > upper or abs(number - round(number)) > 0.000001:
+        raise PersistenceError(f"{name} must be between {lower} and {upper}")
+    return int(round(number))
+
+
+def _boolean(value, name):
+    if not isinstance(value, bool):
+        raise PersistenceError(f"{name} must be true or false")
+    return value
+
+
 def _presets(value):
     if not isinstance(value, str):
         raise PersistenceError("presets must be a string")
@@ -465,9 +483,39 @@ def validate_changes(changes):
                 output[key] = _number(value, key)
         elif key == "presets":
             output[key] = _presets(value)
+        elif key in ("thermalGuard", "telemetryEnabled"):
+            output[key] = _boolean(value, key)
+        elif key in ("thermalHighC", "thermalLowC"):
+            output[key] = _bounded_integer(value, key, -20, 150)
+        elif key == "thermalCooldown":
+            output[key] = _bounded_integer(value, key, 0, 86400)
+        elif key == "boostMinutes":
+            output[key] = _bounded_integer(value, key, 1, 1440)
+        elif key == "thermalCapGHz":
+            output[key] = _number(value, key)
         else:
             output[key] = _safe_value(value)
     return output
+
+
+def _validate_entry(entry):
+    if not isinstance(entry, dict):
+        raise PersistenceError("Boost settings entry is invalid")
+    validated = validate_changes({key: value for key, value in entry.items() if key != "id"})
+    entry.update(validated)
+    if "thermalHighC" in entry and "thermalLowC" in entry and entry["thermalLowC"] >= entry["thermalHighC"]:
+        raise PersistenceError("thermalLowC must be below thermalHighC")
+    if "thermalGuard" in entry and entry["thermalGuard"]:
+        defaults = {
+            "thermalHighC": 90,
+            "thermalLowC": 80,
+            "thermalCapGHz": "3.0",
+            "thermalCooldown": 60,
+        }
+        for key, value in defaults.items():
+            entry.setdefault(key, value)
+        if entry["thermalLowC"] >= entry["thermalHighC"]:
+            raise PersistenceError("thermalLowC must be below thermalHighC")
 
 
 def _update_entries(data, changes):
@@ -483,6 +531,7 @@ def _update_entries(data, changes):
         for entry in entries:
             if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
                 entry.update(changes)
+                _validate_entry(entry)
                 found = True
     if not found:
         raise PersistenceError(f"{PLUGIN_ID} not found in bar layout")
