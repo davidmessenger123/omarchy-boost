@@ -1,116 +1,123 @@
 #!/usr/bin/python3
-"""boostctl — read or change the CPU max-boost cap.
-
-Subcommands (from the Boost bar widget):
-  get          Print JSON of the current board state (read-only, user).
-  set <N.m>    Cap all online cores to N GHz; "max" -> cpuinfo_max_freq.
-  apply        Apply the value persisted in ./maxboost (see README); used by
-               cpu-cap-boost.service on boot.
-  monitor      Write the board state as JSON to a file every 2 s (option
-               --state-file); the bar widget watches that file instead of
-               spawning `get` twice a second. Never exits.
-
-Options:
-  --persist-dir DIR   Where maxboost lives (default: next to this script).
-                      The root-owned copy under /usr/libexec uses the user's
-                      plugin dir so the boot service reads the same cap the
-                      widget persisted.
-
-`set`/`apply` write /sys/devices/system/cpu, which needs root — the widget
-invokes them with `pkexec`, and a polkit rule grants this exact script
-passwordless elevation (see /etc/polkit-1/rules.d/50-davidjm-boost.rules).
-"""
+"""Read-only CPU boost state for the Boost bar widget."""
 
 import argparse
 import glob
 import json
+import math
 import os
+import stat
 import sys
 import time
 
 CPU_ROOT = "/sys/devices/system/cpu"
-PERSIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maxboost")
+MAX_FREQ_KHZ = 10_000_000
+MIN_SENSOR = -50000
+MAX_SENSOR = 200000
 
 
-def set_persist_dir(plugin_dir):
-    """Point maxboost at the real user-writable plugin dir (the root-owned
-    /usr/libexec copy can't write its own)."""
-    global PERSIST_PATH
-    if plugin_dir:
-        PERSIST_PATH = os.path.join(plugin_dir, "maxboost")
-    return PERSIST_PATH
-
-
-def cpu_dirs():
-    return sorted(glob.glob(os.path.join(CPU_ROOT, "cpu[0-9]*", "cpufreq")))
-
-
-def read_int(path):
+def _cpu_number(directory):
+    name = os.path.basename(os.path.dirname(directory))
+    if not name.startswith("cpu"):
+        return None
     try:
-        with open(path, encoding="utf-8") as fh:
-            return int(fh.read().split()[0])
-    except (OSError, ValueError, IndexError):
+        return int(name[3:])
+    except ValueError:
         return None
 
 
-def cap_all(ghz):
-    """Cap every online core, never above that core's own reported maximum
-    (cpuinfo_max_freq). Cores can have individual turbo ceilings, so each one
-    is clamped separately — this is the hard backstop against exceeding what
-    the CPU reports, and it applies to `set`, `apply`, and the boot service."""
-    wanted = str(ghz).lower()
+def _read_int(path, lower=0, upper=MAX_FREQ_KHZ):
     try:
-        wanted_hz = None if wanted == "max" else int(round(float(wanted) * 1_000_000))
-    except ValueError as exc:
-        raise ValueError(f"invalid boost cap: {ghz!r}") from exc
-    for d in cpu_dirs():
-        if wanted_hz is None:
-            target = read_int(os.path.join(d, "cpuinfo_max_freq"))
-        else:
-            target = wanted_hz
-        if target is None:
-            continue
-        ceiling = read_int(os.path.join(d, "cpuinfo_max_freq"))
-        if ceiling is not None:
-            target = min(target, ceiling)
-        if target <= 0:
-            continue
-        with open(os.path.join(d, "scaling_max_freq"), "w", encoding="utf-8") as fh:
-            fh.write(f"{target}\n")
+        with open(path, encoding="utf-8") as fh:
+            value = int(fh.read(128).strip().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    if value < lower or value > upper:
+        return None
+    return value
 
 
-def persisted():
+def _is_online(directory):
+    path = os.path.join(os.path.dirname(directory), "online")
     try:
-        with open(PERSIST_PATH, encoding="utf-8") as fh:
-            value = fh.read().strip()
+        with open(path, encoding="utf-8") as fh:
+            return fh.read(64).strip() == "1"
+    except FileNotFoundError:
+        return True
     except OSError:
-        value = ""
-    if value.lower() == "max":
-        return value
+        return False
+
+
+def cpu_dirs(online_only=False):
+    paths = glob.glob(os.path.join(CPU_ROOT, "cpu[0-9]*", "cpufreq"))
+    paths.sort(key=lambda path: _cpu_number(path) if _cpu_number(path) is not None else -1)
+    return [path for path in paths if os.path.isdir(path) and (not online_only or _is_online(path))]
+
+
+def _read_text(path, limit=4096):
     try:
-        float(value)
-        return value
-    except ValueError:
-        return "3.0"
+        with open(path, encoding="utf-8") as fh:
+            return fh.read(limit + 1)
+    except OSError:
+        return ""
+
+
+def _sensor_value(base, stem):
+    value = _read_int(os.path.join(base, stem + "_input"), MIN_SENSOR, MAX_SENSOR)
+    return None if value is None else value / 1000.0
+
+
+def _package_sensor(hwmon_root="/sys/class/hwmon"):
+    try:
+        entries = sorted(os.scandir(hwmon_root), key=lambda entry: entry.name)
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=True):
+                continue
+            name = _read_text(os.path.join(entry.path, "name"), 128).strip()
+            if name not in ("coretemp", "k10temp", "zenpower"):
+                continue
+            candidates = []
+            for filename in sorted(os.listdir(entry.path)):
+                if not filename.endswith("_label"):
+                    continue
+                stem = filename[:-len("_label")]
+                label = _read_text(os.path.join(entry.path, stem + "_label"), 128).strip()
+                normalized = label.lower().replace(" ", "")
+                if name == "coretemp" and (normalized == "packageid0" or normalized.startswith("packageid")):
+                    candidates.append(stem)
+                elif name in ("k10temp", "zenpower") and (normalized in ("tctl", "tdie", "package", "packageid0") or normalized.startswith("package")):
+                    candidates.append(stem)
+            if not candidates and name in ("k10temp", "zenpower"):
+                candidates.append("temp1")
+            for stem in candidates:
+                value = _sensor_value(entry.path, stem)
+                if value is not None and math.isfinite(value):
+                    return round(value, 1)
+        except OSError:
+            continue
+    return None
+
+
+def package_temp(hwmon_root="/sys/class/hwmon"):
+    return _package_sensor(hwmon_root)
 
 
 def base_freq():
-    """Best available 'base' clock: base_frequency, else the CPPC nominal."""
-    for d in cpu_dirs():
-        base = read_int(os.path.join(d, "base_frequency"))
-        if base is not None:
-            return base
+    for directory in cpu_dirs():
+        value = _read_int(os.path.join(directory, "base_frequency"), 100_000, MAX_FREQ_KHZ)
+        if value is not None:
+            return value
     for entry in sorted(glob.glob(os.path.join(CPU_ROOT, "cpu[0-9]*", "acpi_cppc", "nominal_freq"))):
-        nominal = read_int(entry)
-        if nominal is not None:
-            return nominal
+        value = _read_int(entry, 1, MAX_FREQ_KHZ)
+        if value is not None:
+            return value * 1_000 if value < 100_000 else value
     return None
 
 
 def cpu_info():
-    """Model name, physical cores per socket, and logical thread count from
-    /proc/cpuinfo — vendor-agnostic, so the widget can label itself on
-    basically any x86 (or ARM) machine without a lookup table."""
     model = "Unknown CPU"
     cores = None
     threads = 0
@@ -118,39 +125,40 @@ def cpu_info():
         with open("/proc/cpuinfo", encoding="utf-8") as fh:
             for line in fh:
                 key, _, value = line.partition(":")
-                k = key.strip().lower()
-                v = value.strip()
-                if k == "model name" and model == "Unknown CPU":
-                    model = v or model
-                elif k == "cpu cores" and cores is None:
+                name = key.strip().lower()
+                text = value.strip()
+                if name == "model name" and model == "Unknown CPU":
+                    model = text or model
+                elif name == "cpu cores" and cores is None:
                     try:
-                        cores = int(v)
+                        cores = int(text)
                     except ValueError:
                         pass
-                elif k == "processor":
+                elif name == "processor":
                     threads += 1
     except OSError:
         pass
     return {"model": model, "cores": cores, "threads": threads}
 
 
+def persisted():
+    return None
+
+
 def get_state():
-    caps, turbos = [], []
-    for d in cpu_dirs():
-        cap = read_int(os.path.join(d, "scaling_max_freq"))
-        turbo = read_int(os.path.join(d, "cpuinfo_max_freq"))
+    caps = []
+    turbos = []
+    for directory in cpu_dirs(online_only=True):
+        cap = _read_int(os.path.join(directory, "scaling_max_freq"), 1, MAX_FREQ_KHZ)
+        turbo = _read_int(os.path.join(directory, "cpuinfo_max_freq"), 1, MAX_FREQ_KHZ)
         if cap is not None:
             caps.append(cap)
         if turbo is not None:
             turbos.append(turbo)
     base = base_freq()
     info = cpu_info()
-    # Hybrid P+E CPUs: efficiency cores report a lower native turbo, so every
-    # core capped at the user's value would make min(caps) read back the small
-    # E-core ceiling. The cap that matters is what the top (P) cores hold.
-    max_cap = max(caps) if caps else None
     return {
-        "max": round(max_cap / 1e6, 1) if max_cap else None,
+        "max": round(max(caps) / 1e6, 1) if caps else None,
         "turbo": round(max(turbos) / 1e6, 1) if turbos else None,
         "base": round(base / 1e6, 1) if base else None,
         "temp": package_temp(),
@@ -161,53 +169,28 @@ def get_state():
     }
 
 
-def package_temp(hwmon_root="/sys/class/hwmon"):
-    """Package temperature straight from hwmon (no `sensors` subprocess).
-
-    Intel: coretemp "Package id 0". AMD: k10temp's temp1 (Tctl/Tdie).
-    """
-    try:
-        for entry in sorted(os.listdir(hwmon_root)):
-            base = os.path.join(hwmon_root, entry)
-            try:
-                with open(os.path.join(base, "name"), encoding="utf-8") as fh:
-                    name = fh.read().strip()
-            except OSError:
-                continue
-            if name == "coretemp":
-                for f in os.listdir(base):
-                    if not f.endswith("_label"):
-                        continue
-                    with open(os.path.join(base, f), encoding="utf-8") as fh:
-                        if fh.read().strip() != "Package id 0":
-                            continue
-                    inp = f[: -len("_label")] + "_input"
-                    with open(os.path.join(base, inp), encoding="utf-8") as fh:
-                        return round(int(fh.read().strip()) / 1000.0, 1)
-            elif name == "k10temp":
-                with open(os.path.join(base, "temp1_input"), encoding="utf-8") as fh:
-                    return round(int(fh.read().strip()) / 1000.0, 1)
-    except Exception:
-        pass
-    return None
-
-
 def write_state(state_file, state):
-    """Write the state JSON in place. The bar's FileView watches via
-    QFileSystemWatcher, which binds to the file's inode; a tmp+rename swap
-    would orphan the watcher on the first rewrite and freeze the readout.
-    The write takes microseconds, so a reader that catches a partial file
-    simply parses the next tick."""
-    with open(state_file, "w", encoding="utf-8") as fh:
-        json.dump(state, fh)
-        fh.flush()
-        os.fsync(fh.fileno())
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(state_file, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise ValueError("refusing unsafe monitor state file")
+        os.ftruncate(fd, 0)
+        os.fchmod(fd, 0o600)
+        payload = (json.dumps(state, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short monitor state write")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def monitor(state_file, interval=2.0):
-    """Long-lived state pump for the bar widget: one process instead of a `get`
-    spawn every tick. First write lands immediately so the readout isn't blank
-    at login; transient sysfs hiccups keep the loop alive."""
     while True:
         try:
             write_state(state_file, get_state())
@@ -217,42 +200,22 @@ def monitor(state_file, interval=2.0):
 
 
 def main(argv=None):
-    args = argv if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(prog="boostctl.py", description=__doc__)
-    ap.add_argument("--persist-dir", default=None, help="dir holding maxboost")
-    ap.add_argument("--state-file", default=None, help="monitor JSON output path")
-    ap.add_argument("command", nargs="?", choices=["get", "set", "apply", "monitor"])
-    ap.add_argument("value", nargs="?")
-    parsed = ap.parse_args(args)
+    parser = argparse.ArgumentParser(prog="boostctl.py", description=__doc__)
+    parser.add_argument("--state-file")
+    parser.add_argument("command", nargs="?", choices=["get", "monitor"])
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
-    set_persist_dir(parsed.persist_dir)
-
-    if parsed.command == "get":
-        print(json.dumps(get_state()))
-    elif parsed.command == "set":
-        ghz = parsed.value if parsed.value is not None else persisted()
-        try:
-            if str(ghz).lower() != "max":
-                float(ghz)
-        except ValueError:
-            print(f"invalid boost cap: {ghz!r}", file=sys.stderr)
-            sys.exit(2)
-        try:
-            cap_all(ghz)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            sys.exit(2)
-    elif parsed.command == "apply":
-        cap_all(persisted())
-    elif parsed.command == "monitor":
-        if not parsed.state_file:
-            print("monitor needs --state-file", file=sys.stderr)
-            sys.exit(2)
-        monitor(parsed.state_file)
-    else:
-        ap.print_usage(sys.stderr)
-        sys.exit(2)
+    if args.command == "get":
+        print(json.dumps(get_state(), allow_nan=False, separators=(",", ":")))
+        return 0
+    if args.command == "monitor":
+        if not args.state_file:
+            parser.error("monitor needs --state-file")
+        monitor(args.state_file)
+        return 0
+    parser.print_usage(sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

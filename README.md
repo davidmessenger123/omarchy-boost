@@ -10,8 +10,9 @@ An Omarchy bar widget that lets you cap your CPU's max boost clock on the fly.
 - The bar button shows the live cap (and package temperature in the tooltip).
 
 Changes apply to every online core immediately, persist in the widget's
-shell.json entry, and are re-applied at boot by the `cpu-cap-boost.service`
-systemd unit.
+shell.json entry after the privileged helper succeeds, and are re-applied at
+boot by the `cpu-cap-boost.service` systemd unit. The boot helper reads only
+its validated, root-owned state file; an absent or malformed file fails closed.
 
 ## Install
 
@@ -19,17 +20,22 @@ systemd unit.
 omarchy plugin add https://github.com/davidmessenger123/omarchy-boost.git --enable
 ```
 
-The widget needs passwordless root elevation (to write
-`scaling_max_freq`) and a boot service (to re-apply the cap on reboot). A
-small installer writes both for you, deriving your real user and plugin
-path automatically:
+The widget needs passwordless access to one separately installed, root-owned
+helper (to write `scaling_max_freq`) and a boot service (to re-apply the cap
+on reboot). The installer verifies one opened snapshot of the helper against a
+pinned SHA-256 digest before writing it, then writes a narrowly scoped polkit
+rule and the service, deriving the target user automatically:
 
 ```sh
 sudo python3 ~/.config/omarchy/plugins/davidjm.boost/setup.py
 ```
 
 (It is idempotent — safe to re-run. Use `--dry-run` to see what it writes
-first.)
+first.) To remove the root integration and its persisted state, run:
+
+```sh
+sudo python3 ~/.config/omarchy/plugins/davidjm.boost/setup.py --uninstall
+```
 
 Finally add it to the bar:
 
@@ -42,14 +48,26 @@ omarchy bar put davidjm.boost --section right
 | File | Purpose |
 | --- | --- |
 | `Boost.qml` | The bar widget: readout, slider panel, presets, popup |
-| `boostctl.py` | Helper: `get` (read sysfs/sensors) and `set`/`apply` (write `scaling_max_freq`) |
-| `persist.py` | Persists `maxGHz` into shell.json and mirrors it to `maxboost` |
-| `maxboost` | The Last-applied cap, read back by the boot service |
+| `boostctl.py` | Unprivileged read-only monitor: `get` sysfs and sensor state |
+| `boostset.py` | Root-owned fixed-path helper: validates and applies `set`/`apply` |
+| `persist.py` | Validated, transactionally locked writer for the widget's shell.json entry |
+| `setup.py` | Installs/removes the root helper, polkit rule, service, and state |
+| `tests/test_boost.py` | Standard-library tests for privilege boundaries, validation, persistence, and cleanup primitives |
+| `/var/lib/omarchy-boost/maxboost` | Root-owned last-applied cap, written only after a successful apply |
 
-`set`/`apply` write `/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq`,
-which needs root. The widget elevates **only this script** through `pkexec`;
-a polkit rule grants it passwordless access, so dragging the slider never
-prompts.
+`persist.py` updates only `davidjm.boost` entries after re-reading the latest
+configuration under the shared `.shell.json.lock`. Its shared transaction
+journal restores the prior file and mode after an interrupted write.
+
+`boostset.py` writes only fixed
+`/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq` controls and the
+fixed `/var/lib/omarchy-boost/maxboost` state file. It rejects extra
+arguments, non-finite/out-of-range caps, symlinked or foreign state files, and
+serializes sysfs application with root-state persistence under one lock. It
+snapshots every target's prior cap and restores those values if any write,
+readback, or persistence step fails. The widget elevates this separate helper
+through `pkexec`; the unprivileged `boostctl.py get` path is never authorized
+by the polkit rule.
 
 Works on both Intel and AMD x86: with `amd-pstate` the cap is applied as a
 CPPC max-performance limit (kernels ≥ 6.5), and `acpi-cpufreq` honours the
@@ -126,53 +144,84 @@ show and cap BASE at your CPU's real base clock, e.g. 3.8 on a 5800X:
 
 ## What the installer generates (reference)
 
-`setup.py` writes these two files with the placeholders already filled in
-from your real user and plugin path:
+`setup.py` installs these root-owned artifacts with the target user already
+filled in:
 
-1. The passwordless polkit rule:
+1. The separate helper at
+   `/usr/local/libexec/omarchy-boost/boostset.py` and its private state
+   directory `/var/lib/omarchy-boost/`.
+2. The passwordless polkit rule, restricted to that installed helper:
 
    ```js
    // /etc/polkit-1/rules.d/50-davidjm-boost.rules
    polkit.addRule(function (action, subject) {
      if (action.id == "org.freedesktop.policykit.exec" &&
+         subject.local &&
          subject.user == "YOURUSER" &&
          action.lookup("program") ==
-           "/home/YOURUSER/.config/omarchy/plugins/davidjm.boost/boostctl.py") {
+           "/usr/local/libexec/omarchy-boost/boostset.py") {
        return polkit.Result.YES;
      }
    });
    ```
 
-2. The boot-persistence systemd unit:
+3. The boot-persistence systemd unit:
 
    ```ini
    # /etc/systemd/system/cpu-cap-boost.service
    [Unit]
    Description=Apply persisted CPU max-boost cap
    After=multi-user.target
+   ConditionPathExists=/var/lib/omarchy-boost/maxboost
 
    [Service]
    Type=oneshot
-   ExecStart=/usr/bin/python3 /home/YOURUSER/.config/omarchy/plugins/davidjm.boost/boostctl.py apply
+   ExecStart=/usr/bin/python3 -I /usr/local/libexec/omarchy-boost/boostset.py apply
    RemainAfterExit=yes
+   UMask=0077
+   NoNewPrivileges=yes
+   PrivateDevices=yes
+   PrivateTmp=yes
+   PrivateNetwork=yes
+   ProtectSystem=strict
+   ReadWritePaths=-/sys/devices/system/cpu -/var/lib/omarchy-boost
+   ProtectHome=yes
+   ProtectKernelLogs=yes
+   ProtectControlGroups=yes
+   ProtectKernelModules=yes
+   ProtectHostname=yes
+   RestrictSUIDSGID=yes
+   RestrictRealtime=yes
+   LockPersonality=yes
+   MemoryDenyWriteExecute=yes
+   SystemCallArchitectures=native
+   RestrictAddressFamilies=AF_UNIX
+   CapabilityBoundingSet=
+   AmbientCapabilities=
+   SystemCallFilter=@system-service
+   SystemCallFilter=~@mount @module @raw-io @reboot @swap @debug
 
    [Install]
    WantedBy=multi-user.target
    ```
 
    and enables it (`systemctl enable cpu-cap-boost.service` after a
-   `daemon-reload`).
+   `daemon-reload`). `--uninstall` disables/removes the service, rule, helper,
+   lock file, and state directory without following symlinks.
 
-   The polkit rule scopes passwordless `pkexec` to **only** this plugin's
-   `boostctl.py`, so nothing else on the system gains rights.
+   The polkit rule never authorizes the user-writable plugin directory. The
+   only root-writable application paths are fixed sysfs controls and the fixed
+   root-owned state file.
 
 ## Notes
 
 - The cap applies per-core; cores keep their own turbo ceilings (e.g. some at
   4.9 GHz, others 5.0 GHz), so "MAX" restores each core's native maximum.
-- The `maxboost` file holds the last value written (a number, or `max`).
+- `/var/lib/omarchy-boost/maxboost` holds the last successfully applied value
+  (a number, or `max`); an invalid or missing file makes the boot unit fail
+  closed instead of choosing a fallback cap.
 - Toggling the Omarchy power profile to Balanced/Performance does not fight the
   slider: `scaling_max_freq` is the harder limit and HWP honors the lower of
   the two.
-- This plugin is intentionally laptop-tuned (i9-11950H): slider range 1.0–5.0
-  GHz, BASE = the chip's `base_frequency`.
+- The slider range is derived from the running CPU's reported ceiling, with a
+  1.0 GHz lower bound.

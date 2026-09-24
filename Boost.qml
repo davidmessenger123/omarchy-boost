@@ -10,11 +10,10 @@ import qs.Ui
 // overclock as its max), only lower or lift a previously-lowered cap up to
 // that reported ceiling.
 //
-// The widget reads the live cap straight from sysfs (readable by anyone, no
-// elevation needed) and applies changes through boostctl.py, the one program
-// a polkit rule lets the user run passwordlessly via pkexec. The chosen cap is
-// persisted into this widget's shell.json entry AND a small maxboost file next
-// to this QML; the cpu-cap-boost.service systemd oneshot re-applies it at boot.
+// The widget reads the live cap through the unprivileged boostctl.py monitor
+// and applies changes through the separately installed root-owned boostset.py
+// helper. The helper persists only a validated cap in a root-owned state file;
+// the widget's shell.json entry is updated only after the helper succeeds.
 //
 // Left click: open the slider panel. Right click: cycle presets on the fly.
 // Middle click: re-read the current cap from sysfs.
@@ -26,7 +25,10 @@ BarWidget {
 
   // Absolute path to this plugin's folder (trailing slash), resolved from the
   // QML file itself so the helpers are found wherever the plugin lives.
-  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")
+  readonly property string pluginDir: {
+    var path = String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")
+    return path.charAt(path.length - 1) === "/" ? path : path + "/"
+  }
 
   // The intended cap from settings (persisted); the bar readout instead shows
   // the sysfs truth (`state.max`) so out-of-band changes are always visible.
@@ -50,6 +52,11 @@ BarWidget {
   // Set by right-click cycling: once the pending apply lands, fire a desktop
   // notification saying what the new max boost is.
   property bool notifyNext: false
+
+  property string pendingApplyGHz: ""
+  property real pendingGHz: -1
+  property string pendingSettingsEntry: ""
+  property bool persistInFlight: false
 
   // Live board state, parsed from `boostctl.py get`.
   property var state: ({})
@@ -94,16 +101,17 @@ BarWidget {
   // BIOS reports as 5.0). Either way the widget can't ask for more than the
   // CPU reports, and boostctl.py enforces the same limit at sysfs.
   function cpuMax() {
+    var ceiling = 100.0
     var over = Number(root.capMax)
     if (isFinite(over) && over >= 1.0) {
       var t = Number(root.state.turbo)
-      if (isFinite(t) && t > 0) return Math.min(over, t)
-      return over
+      if (isFinite(t) && t > 0) return Math.min(over, t, ceiling)
+      return Math.min(over, ceiling)
     }
     var t = Number(root.state.turbo)
-    if (isFinite(t) && t > 0) return t
+    if (isFinite(t) && t > 0) return Math.min(t, ceiling)
     var c = Number(root.maxGHz)
-    if (isFinite(c) && c > 0) return c
+    if (isFinite(c) && c > 0) return Math.min(c, ceiling)
     return 3.0
   }
 
@@ -111,9 +119,9 @@ BarWidget {
   // whatever boostctl detected, then a sensible 2.6 last resort.
   function baseGHzValue() {
     var o = Number(root.baseGHz)
-    if (isFinite(o) && o > 0) return o
+    if (isFinite(o) && o > 0) return Math.min(o, 100.0)
     var b = Number(root.state.base)
-    if (isFinite(b) && b > 0) return b
+    if (isFinite(b) && b > 0) return Math.min(b, 100.0)
     return 2.6
   }
 
@@ -231,9 +239,18 @@ BarWidget {
   function applySettingsEntry(changes, notice) {
     var entry = root.mergedEntry(changes)
     root.settings = entry
-    persistProcess.command = ["python3", root.pluginDir + "persist.py", JSON.stringify(entry)]
-    persistProcess.running = true
+    root.pendingSettingsEntry = JSON.stringify(entry)
+    if (!root.persistInFlight) root.startPersistence()
     if (notice) root.keyNotice = notice
+  }
+
+  function startPersistence() {
+    if (root.persistInFlight || !root.pendingSettingsEntry) return
+    var payload = root.pendingSettingsEntry
+    root.pendingSettingsEntry = ""
+    root.persistInFlight = true
+    persistProcess.command = ["/usr/bin/python3", root.pluginDir + "persist.py", payload]
+    persistProcess.running = true
   }
 
   function savePresets(norm) {
@@ -272,56 +289,39 @@ BarWidget {
 
   // --------------------------------------------------------------- state sync
 
-  // Middle-click "re-read": force the state FileView to re-read its file now.
-  // The monitor daemon keeps it refreshed every 2 s, so this is mostly for
-  // immediacy after an out-of-band change.
   function refreshState() {
     stateFile.reload()
   }
 
   function parseState(text) {
+    var source = String(text || "")
+    if (!source || source.length > 1048576) return
     var json = {}
-    try { json = JSON.parse(text) } catch (e) { json = {} }
+    try { json = JSON.parse(source) } catch (e) { return }
+    if (!json || typeof json !== "object" || Array.isArray(json)) return
+    var numeric = ["max", "turbo", "base", "temp"]
+    for (var i = 0; i < numeric.length; i++) {
+      var value = json[numeric[i]]
+      if (value !== null && value !== undefined && (typeof value !== "number" || !isFinite(value))) return
+    }
     if (json.max !== undefined) root.state = json
-  }
-
-  // A release that lands while the previous `set` is still in flight is queued
-  // here and applied as soon as that pkexec exits, so a quick re-drag can't
-  // drop the newer cap.
-  property real pendingGHz: -1
-
-  // Is the root-owned helper installed (/usr/libexec)? The polkit rule only
-  // authorizes that copy (installed by setup.py), never the user-writable
-  // plugin-dir script. Probe it once; fall back to the plugin copy for
-  // installs that haven't run setup yet.
-  property bool installedHelper: false
-  FileView {
-    id: helperProbe
-    path: "/usr/libexec/davidjm-boost/boostctl.py"
-    printErrors: false
-    onLoaded: root.installedHelper = true
-  }
-
-  function boostctlScript() {
-    return root.installedHelper
-      ? "/usr/libexec/davidjm-boost/boostctl.py"
-      : root.pluginDir + "boostctl.py"
   }
 
   // ------------------------------------------------------------------- apply
 
   function applyValue(ghz) {
     var n = Number(ghz)
-    if (!isFinite(n)) return false
-    // The hard ceiling is the CPU's reported turbo; before that loads we never
-    // go above the persisted value. Either way the widget can't ask for more
-    // than the CPU reports, and boostctl.py enforces the same limit at sysfs.
-    n = Math.min(n, root.cpuMax())
+    if (!isFinite(n) || n <= 0) return false
+    n = Math.min(n, root.cpuMax(), 100.0)
     n = Math.max(1.0, Math.round(n * 10) / 10)
+    if (!isFinite(n) || n <= 0) return false
     root.dragGHz = -1
     if (applyProcess.running) {
-      // A previous apply is in flight — remember the newest request.
       root.pendingGHz = n
+      var queued = root.state || {}
+      queued.max = n
+      root.state = queued
+      root.keyNotice = "Queued " + root.fmt(n) + " GHz…"
       return true
     }
     root.startApply(n)
@@ -329,10 +329,9 @@ BarWidget {
   }
 
   function startApply(n) {
-    applyProcess.command = ["pkexec", root.boostctlScript(), "set", n.toFixed(1)]
+    root.pendingApplyGHz = n.toFixed(1)
+    applyProcess.command = ["pkexec", "/usr/local/libexec/omarchy-boost/boostset.py", "set", root.pendingApplyGHz]
     applyProcess.running = true
-    root.persistValue(n)
-    // Optimistically mirror the new cap into the readout before the poll lands.
     var fresh = root.state || {}
     fresh.max = n
     root.state = fresh
@@ -341,10 +340,6 @@ BarWidget {
 
   function persistValue(ghz) {
     var cap = Number(ghz).toFixed(1)
-    // Push the value into this widget's own settings immediately so the button
-    // and slider reflect it without waiting for the shell's shell.json watch.
-    // The full unioned entry is persisted so a cap change never drops any of
-    // the other settings (presets, capMax, baseGHz) that share the entry.
     root.applySettingsEntry({ "maxGHz": cap })
   }
 
@@ -363,45 +358,45 @@ BarWidget {
     if (root.applyValue(target)) root.notifyNext = true
   }
 
-  // State arrives from the monitor daemon's state file (see below).
-
   Process {
     id: applyProcess
     onExited: function(exitCode) {
-      if (root.pendingGHz >= 0) {
-        // A newer cap came in while this one was applying — chain it now.
-        var next = root.pendingGHz
-        root.pendingGHz = -1
-        root.startApply(next)
-        return
-      }
-      if (exitCode === 0) {
-        root.keyNotice = "Boost capped at " + root.fmt(root.state.max) + " GHz."
+      var applied = root.pendingApplyGHz
+      root.pendingApplyGHz = ""
+      if (exitCode === 0 && applied) {
+        root.persistValue(applied)
+        root.keyNotice = "Boost capped at " + root.fmt(applied) + " GHz."
         if (root.notifyNext) {
           root.notifyNext = false
           Quickshell.execDetached(["omarchy-notification-send", "Boost",
-            "Max boost set to " + root.fmt(root.state.max) + " GHz",
+            "Max boost set to " + root.fmt(applied) + " GHz",
             "-g", "\uf0e7", "--app-name", "davidjm.boost", "-t", "4000"])
         }
       } else {
-        root.keyNotice = "Apply failed — is the polkit rule installed?"
+        root.keyNotice = "Apply failed — the root helper rejected the cap."
+      }
+      if (root.pendingGHz >= 0) {
+        var next = root.pendingGHz
+        root.pendingGHz = -1
+        root.startApply(next)
       }
     }
   }
 
-  Process { id: persistProcess }
+  Process {
+    id: persistProcess
+    onExited: function(exitCode) {
+      root.persistInFlight = false
+      if (exitCode !== 0) root.keyNotice = "Settings were not persisted."
+      if (root.pendingSettingsEntry) root.startPersistence()
+    }
+  }
 
-  // One long-lived `boostctl.py monitor` writes the board state to a file
-  // every 2 s; a FileView watches it. This replaces the old design that
-  // spawned a brand-new `python3 boostctl.py get` every 2 s (~43k processes a
-  // day), with no extra spawns, no unbounded stdout buffering, and instant
-  // first state at startup. Restart with a debounce if the daemon ever dies.
   readonly property string statePath: "/tmp/davidjm-boost-state.json"
 
   Process {
     id: monitorProc
-    command: ["python3", root.pluginDir + "boostctl.py", "monitor",
-              "--state-file", root.statePath, "--persist-dir", root.pluginDir]
+    command: ["/usr/bin/python3", root.pluginDir + "boostctl.py", "monitor", "--state-file", root.statePath]
     running: true
     onExited: monitorRestart.restart()
   }
